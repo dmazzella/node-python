@@ -98,9 +98,12 @@ def _cancel(token):
     if not _closing: _send(2, token)
 
 def _serve(token):
+    global _drains
     try:
         native = _native_dispatchers.get(token)
-        if native is not None: native[0]()
+        if native is not None:
+            _drains += 1  # before draining: the snapshot includes every call queued so far
+            native[0]()
         elif token in _requests: _op("serve", token)
     except BaseException:
         traceback.print_exc()
@@ -127,8 +130,14 @@ def register_native_dispatcher(dispatch):
         raise RuntimeError("Synchronous native callbacks require an available SIGURG wakeup or Windows Python 3.14+")
     token = next(_tokens)
     def notify():
-        while _main_busy is not None and _main_busy.value and not _wake_main(token):
-            time.sleep(0.001)
+        # A free-threaded main thread can miss a wakeup that lands just before
+        # it parks (e.g. in Thread.join()): repeat it until a drain starts after
+        # this call was queued, or the main thread stops running Python.
+        drains, delay = _drains, 0.001
+        while _main_busy is not None and _main_busy.value and _drains == drains:
+            _wake_main(token)
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
     callback = _NATIVE_NOTIFY(notify)
     _native_dispatchers[token] = (dispatch, callback)
     return token, str(ctypes.cast(callback, ctypes.c_void_p).value)
@@ -181,6 +190,7 @@ export class PythonScheduler {
     module._wakeup = null;
     module._interrupt_event = null;
     module._native_dispatchers = builtins.dict();
+    module._drains = 0;
     module._main_busy = module.ctypes.c_int.from_address(busyAddress);
     module._NOTIFY = module.ctypes.CFUNCTYPE(null, module.ctypes.c_int, module.ctypes.c_int);
     module._NATIVE_NOTIFY = module.ctypes.CFUNCTYPE(null);

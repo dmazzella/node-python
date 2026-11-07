@@ -42,7 +42,8 @@ _get_ident = threading.get_ident
 _async_exc = ctypes.cast(ctypes.pythonapi.PyThreadState_SetAsyncExc, ctypes.c_void_p).value
 _raise_async = ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.c_ulong, ctypes.py_object)(_async_exc)
 _clear_async = ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)(_async_exc)
-_lock = threading.Lock()
+# Reentrant only for _is_owned(): see _settle.
+_lock = threading.RLock()
 _ident = None
 _current = None
 _interrupted = False
@@ -86,7 +87,12 @@ def _settle():
                 _clear_async(_ident, None)
             return
         except _base_error:
-            pass  # an abort that landed after the operation completed
+            # An abort that landed after the operation completed. It can land
+            # right after __enter__ acquired the lock, outside the with block's
+            # protected range, so __exit__ never runs: release it here. At most
+            # one abort is injected per operation, so none can land in here.
+            if _lock._is_owned():
+                _lock.release()
 
 def _cancel(token):
     # Inject at most once, and only into the operation that is running: a
