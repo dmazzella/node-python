@@ -126,7 +126,10 @@ cooperate with Python cancellation.
 `eval` or `import`, or a Python awaitable, and rejects with `signal.reason`
 on abort (`AbortSignal.timeout(ms)` for time limits). A queued operation is
 skipped; running Python code receives one `KeyboardInterrupt`, so `finally`
-blocks run and `except Exception` does not swallow it. Native calls are
+blocks run and `except Exception` does not swallow it. On CPython 3.12 only,
+a one-line loop that starts a `try` block (`try:` followed by `while True: ...`)
+skips that `finally` when interrupted; put the loop body on its own line.
+Native calls are
 interrupted only when they return; asyncio work is cancelled. Synchronous proxy
 access and JavaScript work cannot be aborted.
 

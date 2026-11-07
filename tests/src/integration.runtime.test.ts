@@ -336,8 +336,13 @@ cycle_indirect.append(cycle_tuple)
   it("aborts synchronous Python once with KeyboardInterrupt, running finally blocks", async () => {
     const operation = python.exec(`
 abort_log = []
+spins = 0
 try:
-    while True: pass
+    # Body on its own line: CPython 3.12 skips the finally block when an
+    # asynchronous exception interrupts a one-line "while True: ..." loop that
+    # starts the try block (the backward jump is attributed outside the try).
+    while True:
+        spins += 1
 finally:
     abort_log.append("finally")
 `);
@@ -348,7 +353,7 @@ finally:
     );
     await assert.rejects(operation, (error: unknown) => error instanceof PythonError && error.type === "KeyboardInterrupt");
     assert.deepEqual(await python.eval("abort_log"), ["finally"]);
-    await python.exec("del abort_log");
+    await python.exec("del abort_log, spins");
   });
 
   it("is not swallowed by except Exception and can be handled explicitly", async () => {
