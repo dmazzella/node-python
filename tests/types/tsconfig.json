@@ -1,0 +1,7 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "ESNext.Disposable", "ES2025.Float16"]
+  },
+  "include": ["*.ts"]
+}

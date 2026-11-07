@@ -1,0 +1,36 @@
+name: node-python
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ["24", "26"]
+        python: ["3.12", "3.14", "3.14t", "3.15"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v6
+        id: python
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Verify free-threaded interpreter
+        if: endsWith(matrix.python, 't')
+        run: python -c "import sys, sysconfig; assert sysconfig.get_config_var('Py_GIL_DISABLED') == 1; assert not sys._is_gil_enabled()"
+      - run: npm install --ignore-scripts --no-audit --no-fund
+      - run: npm test
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}

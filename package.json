@@ -1,0 +1,63 @@
+{
+  "name": "@node-ctypes/python",
+  "version": "0.1.0",
+  "description": "Typed embedded CPython for Node.js, powered by node-ctypes",
+  "author": "Damiano Mazzella",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmazzella/node-python.git"
+  },
+  "homepage": "https://github.com/dmazzella/node-python#readme",
+  "bugs": {
+    "url": "https://github.com/dmazzella/node-python/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "keywords": [
+    "python",
+    "cpython",
+    "embedding",
+    "ffi",
+    "node-ctypes",
+    "typescript"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.ts",
+    "typecheck": "tsc -p tsconfig.json && npm run test:types",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "test": "npm run build && npm run test:types && node --test --test-timeout=60000 --test-concurrency=1 \"tests/src/*.test.ts\"",
+    "test:unit": "npm run build && node --test --test-timeout=60000 \"tests/src/unit.*.test.ts\"",
+    "test:integration": "npm run build && node --test --test-timeout=60000 --test-concurrency=1 \"tests/src/integration.*.test.ts\"",
+    "test:stress": "npm run build && npm run test:types && node --test --test-concurrency=1 \"tests/stress/*.test.ts\"",
+    "test:backlog": "npm run build && npm run test:types && node --test --test-concurrency=1 tests/stress/backlog.test.ts",
+    "test:types": "tsc -p tests/tsconfig.json && tsc -p tests/types/tsconfig.json",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "node-ctypes": "^2.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "~6.0.3"
+  }
+}
