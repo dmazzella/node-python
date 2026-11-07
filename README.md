@@ -204,7 +204,7 @@ memory/latency diagnostics, not performance or leak-certification guarantees.
 The runtime does not impose application backpressure.
 
 The [CI workflow](./.github/workflows/ci.yml) runs `npm test` with Python
-3.12, 3.14, 3.14t and 3.15 on Windows, Linux and macOS. It is discovered only when
+3.12, 3.13, 3.14, 3.14t and 3.15 on Windows, Linux and macOS. It is discovered only when
 this package is a repository root, not while nested in another repository.
 For implementation diagrams and ownership invariants, see [FLOWS.md](./FLOWS.md)
 (Italian).
