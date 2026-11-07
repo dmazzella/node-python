@@ -55,8 +55,18 @@ def ordinary_work():
   assert.equal(releases, 128, "collected references must run their Python destructors and JavaScript callbacks");
   assert.ok(acquisitions < collected / 2, `automatic release must batch GIL acquisition (${acquisitions} acquisitions for ${collected} proxies)`);
   assert.ok(ticks >= 5, `Node.js timers must run during Python execution and proxy collection (${ticks} ticks)`);
+  const freeThreaded = await python.eval<boolean>('__import__("sysconfig").get_config_var("Py_GIL_DISABLED") == 1');
   const explicit = await create();
   explicit[Symbol.dispose]();
+  // Free-threaded CPython defers deallocation to the creating thread (here the
+  // executor) when the last reference is dropped elsewhere (biased reference
+  // counting); that thread merges it the next time it runs Python code.
+  if (freeThreaded) {
+    for (const deadline = Date.now() + 5000; releases < 129 && Date.now() < deadline; ) {
+      await python.eval("None");
+      await immediate();
+    }
+  }
   assert.equal(releases, 129, "explicit disposal must still release its reference synchronously");
   await immediate();
   assert.equal(await python.eval("6 * 7"), 42);

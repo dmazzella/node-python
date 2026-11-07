@@ -148,7 +148,9 @@ access and JavaScript work cannot be aborted.
   memory. `proxy.toTypedArray()` requires a C-contiguous Python buffer and copies
   read-only buffers. Do not detach, transfer or resize shared backing memory.
 - Release owned proxies with `[Symbol.dispose]()` when practical, including
-  `PythonError.exception`. GC is nondeterministic. `PythonError` exposes `type`,
+  `PythonError.exception`. GC is nondeterministic. Disposal drops the reference
+  immediately; on free-threaded builds CPython may run the object's destructor
+  later, when the thread that created it next runs Python code. `PythonError` exposes `type`,
   `traceback`, `exception` and, when available, the original JavaScript `cause`.
 
 Only one JavaScript thread per process may host Python. A Node.js worker can
