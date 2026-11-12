@@ -75,6 +75,7 @@ for (const scenario of [
   "multiple-errors",
   "reentrant-finalize",
   "stats-finalize",
+  "finalize-gil-contention",
   "switch-interval",
   "switch-interval-explicit",
   "exit-callback",

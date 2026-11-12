@@ -272,9 +272,12 @@ export class PythonExecutor {
     try {
       const [state, threadState] = await this.#attached;
       // FIFO, after every accepted request: the thread state is released on
-      // its own thread, then the thread stops.
-      await this.#restoreThread.callOn(this.#executor, threadState);
-      await this.#releaseState.callOn(this.#executor, state);
+      // its own thread, then the thread stops. Both are queued before waiting:
+      // between them the executor thread holds the GIL, and it must not wait
+      // for this thread, which may take the GIL meanwhile (e.g. stats()).
+      const restored = this.#restoreThread.callOn(this.#executor, threadState);
+      const released = this.#releaseState.callOn(this.#executor, state);
+      await Promise.all([restored, released]);
     } finally {
       await this.#executor.close();
       this.#withGIL(() => this.#releasePython());

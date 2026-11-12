@@ -232,6 +232,27 @@ print("tail", end="")
   } finally {
     mock.restoreAll();
   }
+} else if (scenario === "finalize-gil-contention") {
+  // The executor releases its thread state at close: it must not hold the GIL
+  // while waiting for this thread, which takes it here on every turn (stats()).
+  // A Python thread keeps the GIL busy, so that those jobs do not complete inline.
+  const python = await Python.initialize({ stdin: false });
+  await python.exec(`
+import threading
+def spin():
+    while True:
+        pass
+threading.Thread(target=spin, daemon=True).start()
+`);
+  let done = false;
+  const poll = () => {
+    if (done) return;
+    python.stats();
+    setImmediate(poll);
+  };
+  setImmediate(poll);
+  await python.finalize();
+  done = true;
 } else if (scenario === "no-shared-array-buffer") {
   // As in a page that is not cross-origin isolated (an Electron renderer):
   // memory is still passed as ArrayBuffer and typed arrays.
