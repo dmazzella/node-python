@@ -18,7 +18,7 @@ export function nextCompletionToken(previous: number, pending: ReadonlyMap<numbe
 export interface Cancellable {
   cancel?: () => void;
 }
-const HELPERS = ["_cancel", "_discard", "_cancelled_outcome"] as const;
+const HELPERS = ["_cancel", "_discard", "_take_failure", "_cancelled_failure"] as const;
 type Helper = (typeof HELPERS)[number];
 const SOURCE = `
 import ctypes
@@ -42,6 +42,8 @@ _ident = None
 _current = None
 _interrupted = False
 _cancelled = set()
+# Exceptions of failed requests, by token, until the host takes them.
+_failures = {}
 
 def _execute(request):
     operation, *args = request
@@ -76,7 +78,10 @@ def _settle():
         try:
             with _lock:
                 _current = None
-                _clear_async(_ident, None)
+                # Only an injected abort can be pending: _cancel injects under
+                # this lock, while this request is _current.
+                if _interrupted:
+                    _clear_async(_ident, None)
             return
         except _base_error:
             # An abort that landed after the operation completed. It can land
@@ -104,20 +109,25 @@ def _discard(token):
     with _lock:
         _cancelled.discard(token)
 
-def _cancelled_outcome():
-    return (False, _interrupt())
+def _take_failure(token):
+    return _failures.pop(token)
+
+def _cancelled_failure():
+    return _interrupt()
 
 def _entry(request, token):
     # Runs on the executor thread; ctypes takes the GIL around the callback.
-    # The outcome is returned as a new reference, owned by the host.
+    # The value is returned as a new reference, owned by the host; a failure
+    # returns NULL and keeps its exception for _take_failure.
     global _ident
     _ident = _get_ident()
     try:
-        outcome = (True, _run(request, token))
+        value = _run(request, token)
     except _base_error as error:
-        outcome = (False, error)
-    _incref(outcome)
-    return id(outcome)
+        _failures[token] = error
+        return None
+    _incref(value)
+    return id(value)
 
 _entry_callback = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.py_object, ctypes.c_int)(_entry)
 _entry_address = ctypes.cast(_entry_callback, ctypes.c_void_p).value
@@ -125,6 +135,9 @@ _entry_address = ctypes.cast(_entry_callback, ctypes.c_void_p).value
 
 // Rejection reason of a request removed from the queue before it ran.
 const CANCELLED = Symbol("cancelled");
+
+/** A request's result (new reference), or the exception it raised (new reference). */
+export type Outcome = { readonly value: bigint } | { readonly error: bigint };
 // node-ctypes internals, not part of its typed API: the id of a call (written
 // into a callOn target with `_job`) and the removal of a call still queued.
 type ExecutorJobs = { _cancel(job: number, reason: unknown): boolean };
@@ -189,7 +202,7 @@ export class PythonExecutor {
     this.#attached.catch(() => undefined);
   }
 
-  callAsync(request: Pointer, control?: Cancellable): Promise<Pointer> {
+  callAsync(request: Pointer, control?: Cancellable): Promise<Outcome> {
     if (this.#abandoned || this.#closing) return Promise.reject(new Error("Python executor is closing"));
     let token: number;
     try {
@@ -211,34 +224,46 @@ export class PythonExecutor {
         // Still queued: removed without running. Otherwise Python interrupts it.
         if (!(this.#executor as unknown as ExecutorJobs)._cancel(job, CANCELLED)) this.#tokenHelper("_cancel", token);
       };
-    const settled = task
-      .then(
-        (outcome) => {
+    // One reaction (no finally: it would add two steps to every request).
+    const done = () => {
+      if (control) control.cancel = undefined;
+      this.#pending.delete(token);
+    };
+    const settled = task.then(
+      (value): Outcome => {
+        try {
           if (cancelled) this.#tokenHelper("_discard", token);
-          return outcome;
-        },
-        (error: unknown) => {
-          if (error === CANCELLED) return this.#withGIL(() => this.#call("_cancelled_outcome"));
+          if (value !== null) return { value };
+          return { error: this.#withGIL(() => this.#withToken(token, (id) => this.#call("_take_failure", [id]))) };
+        } finally {
+          done();
+        }
+      },
+      (error: unknown): Outcome => {
+        try {
+          if (error === CANCELLED) return { error: this.#withGIL(() => this.#call("_cancelled_failure")) };
           throw error;
-        },
-      )
-      .finally(() => {
-        if (control) control.cancel = undefined;
-        this.#pending.delete(token);
-      });
+        } finally {
+          done();
+        }
+      },
+    );
     this.#pending.set(token, settled);
     return settled;
   }
 
   #tokenHelper(name: Helper, token: number): void {
-    this.#withGIL(() => {
-      const id = this.#check(this.#api.PyLong_FromLongLong(token));
-      try {
-        this.#api.Py_DecRef(this.#call(name, [id]));
-      } finally {
-        this.#api.Py_DecRef(id);
-      }
-    });
+    this.#withGIL(() => this.#api.Py_DecRef(this.#withToken(token, (id) => this.#call(name, [id]))));
+  }
+
+  /** `use` with the token as a Python int (GIL held). */
+  #withToken<T>(token: number, use: (id: bigint) => T): T {
+    const id = this.#check(this.#api.PyLong_FromLongLong(token));
+    try {
+      return use(id);
+    } finally {
+      this.#api.Py_DecRef(id);
+    }
   }
 
   #call(name: Helper, args: Pointer[] = []): bigint {

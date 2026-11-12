@@ -194,9 +194,9 @@ sequenceDiagram
     RT->>RT: Con GIL: verifica running, conserva riferimenti, costruisce la richiesta
     RT->>EX: Senza GIL: callOn(_entry, richiesta, token)
     RT-->>JS: Promise
-    EX->>EX: Callback ctypes: prende il GIL, esegue, outcome (successo, valore o eccezione)
-    EX->>RT: Outcome come nuovo riferimento: in linea o dal canale di node-ctypes
-    RT->>RT: Con GIL: consuma outcome, converte o costruisce PythonError
+    EX->>EX: Callback ctypes: prende il GIL, esegue; errore: eccezione in _failures, NULL
+    EX->>RT: Valore come nuovo riferimento (o NULL): in linea o dal canale di node-ctypes
+    RT->>RT: Con GIL: valore o _take_failure, converte o costruisce PythonError, rilascia
     RT-->>JS: Valore, errore oppure Promise dello scheduler
 ```
 
@@ -204,8 +204,16 @@ La coda e quella dell'`Executor` di node-ctypes (FIFO). La richiesta contiene
 operazione e argomenti; le operazioni sono import, esecuzione sorgente e chiamata
 Python. Le tuple mantengono vivi callable e argomenti durante l'attesa.
 `_entry` e una callback `ctypes.CFUNCTYPE`: ctypes prende il GIL intorno alla
-chiamata e la callback restituisce l'outcome come nuovo riferimento, posseduto
-dall'host (nessun registro Python intermedio). La richiesta viene accodata dopo
+chiamata e la callback restituisce il valore come nuovo riferimento, posseduto
+dall'host. Se la richiesta solleva, l'eccezione resta in `_failures` per token e
+la callback restituisce NULL: solo allora l'host la preleva con `_take_failure`
+(una richiesta tolta dalla coda riceve `KeyboardInterrupt` da
+`_cancelled_failure`). L'esecutore JS consegna `{ value }` o `{ error }`
+(`Outcome`). Il nome dell'operazione e convertito in `str` una volta
+(`#operationName`, rilasciato alla chiusura). Una chiamata prende il GIL sul
+thread host due volte: prima dell'invio (argomenti e richiesta) e dopo il
+completamento (esito, risultato, rilascio di richiesta e argomenti, code di
+rilascio). La richiesta viene accodata dopo
 aver rilasciato il GIL: una richiesta breve completa mentre l'host la attende in
 linea (budget per funzione di node-ctypes), le altre tramite il canale di
 completamento di node-ctypes.
@@ -696,7 +704,8 @@ L'eccezione asincrona viene consegnata al successivo controllo dell'interprete
 `try`/`except`/`finally`. Essendo `BaseException`, `except Exception` non la
 intercetta; il codice puo gestirla esplicitamente e terminare normalmente.
 A fine richiesta `_settle` azzera sotto lock l'eccezione eventualmente ancora
-pendente, che quindi non raggiunge la richiesta successiva; un'interruzione
+pendente (solo se `_cancel` l'ha iniettata: entrambi agiscono sotto lo stesso lock),
+che quindi non raggiunge la richiesta successiva; un'interruzione
 arrivata dopo il completamento viene ignorata o rifiuta solo la propria richiesta.
 Le chiamate native vengono interrotte solo al loro ritorno; thread creati dal
 codice utente, accesso sincrono ai proxy e lavoro JavaScript non sono interrotti.

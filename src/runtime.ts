@@ -9,7 +9,7 @@ import { PythonPlatform, lineWriter } from "./platform.ts";
 import { PythonConversions } from "./conversions.ts";
 import { PythonBuffers } from "./buffers.ts";
 import { PythonExecutor } from "./executor.ts";
-import type { Cancellable } from "./executor.ts";
+import type { Cancellable, Outcome } from "./executor.ts";
 import { NativeObjects, nativeSlot } from "./objects.ts";
 import type { NativeSlot } from "./objects.ts";
 import { probeInterpreter, loadLibrary } from "./interpreter.ts";
@@ -21,6 +21,7 @@ import type { ThreadSafeCallbackWrapper } from "node-ctypes";
 
 type Pointer = bigint | null;
 type RuntimeState = "initializing" | "running" | "closing" | "finalized" | "failed";
+type ExecutorOperation = "PyImport_ImportModule" | "PyObject_Call" | "ExecuteSource";
 interface ProxyState {
   ptr: Pointer;
   public: boolean;
@@ -98,6 +99,7 @@ export class Python {
   #state: RuntimeState = "initializing";
   #ownsInterpreter = false;
   #executor!: PythonExecutor;
+  #operations = new Map<string, bigint>(); // executor operation names as Python str (#operationName)
   #pending = new Set<Promise<unknown>>();
   #closing: Promise<void> | null = null;
   #callControls = new WeakMap<Promise<unknown>, CallControl>();
@@ -728,6 +730,8 @@ export class Python {
         this.#withGIL(() => {
           this.#drain();
           this.#nativeObjects?.releaseType();
+          for (const name of this.#operations.values()) this.#api.Py_DecRef(name);
+          this.#operations.clear();
         }, true);
       } catch (error) {
         errors.push(error);
@@ -811,54 +815,68 @@ export class Python {
     }
   }
 
-  async #nativeCall(name: "PyImport_ImportModule" | "PyObject_Call" | "ExecuteSource", args: unknown[], control?: CallControl): Promise<Pointer> {
-    const request = this.#withGIL(
-      () =>
-        this.#filled(this.#api.PyTuple_New(args.length + 1), (tuple) => {
-          this.#status(this.#api.PyTuple_SetItem(tuple, 0, this.#toPy(name)));
-          args.forEach((value, i) => {
-            const pointerArgument = name === "ExecuteSource" ? i === 2 : API[name][1][i] === c_void_p;
-            const ptr = pointerArgument && value !== null ? this.#check(typeof value === "bigint" ? value : null) : this.#toPy(value);
-            if (pointerArgument && value !== null) this.#api.Py_IncRef(ptr);
-            this.#status(this.#api.PyTuple_SetItem(tuple, i + 1, ptr));
-          });
-        }),
-      true,
-    );
-    // Submitted after releasing the GIL: the executor thread can take it at once.
-    let task: Promise<Pointer>;
+  async #nativeCall(name: ExecutorOperation, args: unknown[], control?: CallControl): Promise<Pointer> {
+    const request = this.#withGIL(() => this.#request(name, args), true);
+    let outcome: Outcome;
     try {
-      task = this.#executor.callAsync(request, control);
-      if (control?.aborted) control.cancel?.();
+      outcome = await this.#submit(request, control);
     } catch (error) {
       this.#withGIL(() => this.#api.Py_DecRef(request), true);
       throw error;
     }
-    try {
-      const outcome = await task;
-      return this.#withGIL(() => this.#consumeOutcome(outcome), true);
-    } finally {
-      this.#withGIL(() => this.#api.Py_DecRef(request), true);
-    }
+    return this.#withGIL(() => {
+      try {
+        return this.#consumeOutcome(outcome);
+      } finally {
+        this.#api.Py_DecRef(request);
+      }
+    }, true);
   }
 
-  #consumeOutcome(outcome: Pointer): Pointer {
-    return this.#using(this.#check(outcome), (outcome) => {
-      if (this.#api.PyTuple_Size(outcome) !== 2n) throw new Error("Python executor returned an invalid outcome");
-      const success = this.#status(this.#api.PyObject_IsTrue(this.#api.PyTuple_GetItem(outcome, 0)));
-      const value = this.#check(this.#api.PyTuple_GetItem(outcome, 1));
-      this.#api.Py_IncRef(value);
-      if (success) return value;
-      if (!this.#registry) {
-        try {
-          throw new Error(`Python startup failed: ${this.#take<string>(this.#api.PyObject_Str(value))}`);
-        } finally {
-          this.#api.Py_DecRef(value);
-        }
-      }
-      this.#api.PyErr_SetRaisedException(value);
-      throw this.#fetchError();
+  /** The executor request `(operation, ...args)` (GIL held; new reference). */
+  #request(name: ExecutorOperation, args: unknown[]): bigint {
+    return this.#filled(this.#api.PyTuple_New(args.length + 1), (tuple) => {
+      this.#status(this.#api.PyTuple_SetItem(tuple, 0, this.#operationName(name)));
+      args.forEach((value, i) => {
+        const pointerArgument = name === "ExecuteSource" ? i === 2 : API[name][1][i] === c_void_p;
+        const ptr = pointerArgument && value !== null ? this.#check(typeof value === "bigint" ? value : null) : this.#toPy(value);
+        if (pointerArgument && value !== null) this.#api.Py_IncRef(ptr);
+        this.#status(this.#api.PyTuple_SetItem(tuple, i + 1, ptr));
+      });
     });
+  }
+
+  /**
+   * Submit `request` after releasing the GIL: the executor thread can take it
+   * at once. The caller still owns `request` (also when this throws).
+   */
+  #submit(request: bigint, control?: CallControl): Promise<Outcome> {
+    const task = this.#executor.callAsync(request, control);
+    if (control?.aborted) control.cancel?.();
+    return task;
+  }
+
+  #consumeOutcome(outcome: Outcome): bigint {
+    if ("value" in outcome) return outcome.value;
+    const { error } = outcome;
+    if (!this.#registry) {
+      try {
+        throw new Error(`Python startup failed: ${this.#take<string>(this.#api.PyObject_Str(error))}`);
+      } finally {
+        this.#api.Py_DecRef(error);
+      }
+    }
+    // Steals the reference.
+    this.#api.PyErr_SetRaisedException(error);
+    throw this.#fetchError();
+  }
+
+  /** The executor operation's name as a Python str, converted once (new reference). */
+  #operationName(name: ExecutorOperation): bigint {
+    let cached = this.#operations.get(name);
+    if (cached === undefined) this.#operations.set(name, (cached = this.#toPy(name)));
+    this.#api.Py_IncRef(cached);
+    return cached;
   }
   #track<T>(work: () => Promise<T>): Promise<T> {
     if (this.#state !== "running") return Promise.reject(new Error(this.#finalized ? "Python has been finalized" : "Python is closing"));
@@ -1477,25 +1495,37 @@ export class Python {
   #callAsync(target: PythonObject, args: unknown[], keep = false): Promise<unknown> {
     const control: CallControl = { aborted: false };
     const promise = this.#track(async () => {
-      const held = this.#withGIL(() => {
-        const callable = this.#toPy(target);
-        const values = args.at(-1) instanceof Kwargs ? args.slice(0, -1) : args;
-        const pointers: Pointer[] = [callable];
+      // The GIL twice: arguments and request before the executor, outcome,
+      // result and releases after it.
+      const held: Pointer[] = [];
+      const request = this.#withGIL(() => {
         try {
-          const tuple = this.#filled(this.#api.PyTuple_New(values.length), (tuple) => values.forEach((value, i) => this.#status(this.#api.PyTuple_SetItem(tuple, i, this.#toPy(value)))));
-          pointers.push(tuple);
+          held.push(this.#toPy(target));
+          const values = args.at(-1) instanceof Kwargs ? args.slice(0, -1) : args;
+          held.push(this.#filled(this.#api.PyTuple_New(values.length), (tuple) => values.forEach((value, i) => this.#status(this.#api.PyTuple_SetItem(tuple, i, this.#toPy(value))))));
           const last = args.at(-1);
-          const keywords = last instanceof Kwargs ? this.#toPy(last.values) : null;
-          pointers.push(keywords);
-          return pointers;
+          held.push(last instanceof Kwargs ? this.#toPy(last.values) : null);
+          return this.#request("PyObject_Call", held);
         } catch (error) {
-          for (const ptr of pointers) this.#api.Py_DecRef(ptr);
+          for (const ptr of held) this.#api.Py_DecRef(ptr);
           throw error;
         }
       });
+      const release = () => {
+        this.#api.Py_DecRef(request);
+        for (const ptr of held) this.#api.Py_DecRef(ptr);
+        this.#drain();
+      };
+      let outcome: Outcome;
       try {
-        const result = await this.#nativeCall("PyObject_Call", held, control);
-        return this.#withGIL(() => {
+        outcome = await this.#submit(request, control);
+      } catch (error) {
+        this.#withGIL(release, true);
+        throw error;
+      }
+      return this.#withGIL(() => {
+        try {
+          const result = this.#consumeOutcome(outcome);
           let value: unknown = keep ? this.#wrap(this.#check(result), true) : this.#take(result, true);
           if (this.#states.has(value) && this.#scheduler!.isAwaitable(value as PythonObject)) {
             const awaitable = value as PythonObject;
@@ -1504,13 +1534,10 @@ export class Python {
             if (control.aborted) this.#states.get(awaitable)!.future?.cancel();
           }
           return { value };
-        });
-      } finally {
-        this.#withGIL(() => {
-          for (const ptr of held) this.#api.Py_DecRef(ptr);
-          this.#drain();
-        });
-      }
+        } finally {
+          release();
+        }
+      }, true);
     }).then(({ value }) => value);
     this.#callControls.set(promise, control);
     return promise;

@@ -178,31 +178,45 @@ synchronous_wait = SynchronousWait()
   const python = await Python.initialize({ stdin: false });
   await python.exec("executor_failure_was_run = False");
   const failure = new Error(`Injected ${scenario} failure`);
-  // Enqueue: building the request tuple, before the executor accepts it.
-  // Completion: reading the outcome tuple, after Python ran the request.
-  const operation = scenario === "executor-enqueue-error" ? "PyTuple_New" : "PyTuple_Size";
-  const original = lib[operation];
   let failed = false;
-  Object.defineProperty(PythonLibrary.prototype, operation, {
-    configurable: true,
-    value: (...args: unknown[]) => {
-      if (!failed) {
-        failed = true;
+  // Enqueue: building the request tuple, before the executor accepts it.
+  const original = lib.PyTuple_New;
+  if (scenario === "executor-enqueue-error") {
+    Object.defineProperty(PythonLibrary.prototype, "PyTuple_New", {
+      configurable: true,
+      value: (...args: unknown[]) => {
+        if (!failed) {
+          failed = true;
+          throw failure;
+        }
+        return Reflect.apply(original, undefined, args);
+      },
+    });
+  }
+  // Completion: the executor's outcome fails after Python ran the request.
+  const callAsync = PythonExecutor.prototype.callAsync;
+  if (scenario === "executor-completion-error") {
+    mock.method(PythonExecutor.prototype, "callAsync", function (this: PythonExecutor, ...args: Parameters<typeof callAsync>) {
+      const outcome = Reflect.apply(callAsync, this, args);
+      if (failed) return outcome;
+      failed = true;
+      return outcome.then(() => {
         throw failure;
-      }
-      return Reflect.apply(original, undefined, args);
-    },
-  });
+      });
+    });
+  }
   try {
     await assert.rejects(
       () => python.exec("executor_failure_was_run = True"),
       (error: unknown) => error === failure,
     );
-    Reflect.deleteProperty(PythonLibrary.prototype, operation);
+    Reflect.deleteProperty(PythonLibrary.prototype, "PyTuple_New");
+    mock.restoreAll();
     assert.equal(python.main.executor_failure_was_run, scenario === "executor-completion-error", "only a completion failure may occur after accepted Python work has executed");
-    assert.equal(await python.eval("6 * 7"), 42, "a notification failure must reject its request without stranding later work");
+    assert.equal(await python.eval("6 * 7"), 42, "a completion failure must reject its request without stranding later work");
   } finally {
-    Reflect.deleteProperty(PythonLibrary.prototype, operation);
+    Reflect.deleteProperty(PythonLibrary.prototype, "PyTuple_New");
+    mock.restoreAll();
     await python.finalize();
   }
 } else if (scenario === "console-output") {
