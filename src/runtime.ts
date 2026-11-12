@@ -5,7 +5,7 @@ import { API, MIN_PYTHON, Py_file_input, Py_eval_input, METH_VARARGS, METH_KEYWO
 import type { PythonLibrary } from "./native.ts";
 import { PythonBootstrap } from "./bootstrap.ts";
 import { PythonScheduler } from "./scheduler.ts";
-import { PythonPlatform } from "./platform.ts";
+import { PythonPlatform, lineWriter } from "./platform.ts";
 import { PythonConversions } from "./conversions.ts";
 import { PythonBuffers } from "./buffers.ts";
 import { PythonExecutor } from "./executor.ts";
@@ -57,6 +57,11 @@ class ProxyStates extends WeakMap<object, ProxyState> {
   }
 }
 const DONE = Symbol("done");
+// SharedArrayBuffer is not defined where the page is not cross-origin isolated
+// (e.g. an Electron renderer): only an ArrayBuffer can be passed there.
+function isArrayBuffer(value: unknown): value is ArrayBufferLike {
+  return value instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer);
+}
 function isThenable(value: unknown): value is PromiseLike<unknown> {
   return value !== null && (typeof value === "object" || typeof value === "function") && typeof Reflect.get(value, "then") === "function";
 }
@@ -162,8 +167,8 @@ export class Python {
    * @param {string} [options.executable] - Python interpreter whose library and environment are used (default: $PYTHON, python3, python, py)
    * @param {string} [options.library] - Explicit path of the Python shared library (default: $PYTHON_LIBRARY); same version as the interpreter
    * @param {boolean} [options.stdin=true] - false: Python does not read the process stdin (sys.stdin is None), left to Node.js
-   * @param {"inherit"|"node"|Function} [options.stdout="inherit"] - sys.stdout: the process stdout ("inherit"), process.stdout of Node.js, in order with console.log ("node"), or a function receiving the text
-   * @param {"inherit"|"node"|Function} [options.stderr="inherit"] - sys.stderr, as stdout
+   * @param {"inherit"|"node"|"console"|Function} [options.stdout="inherit"] - sys.stdout: the process stdout ("inherit"), process.stdout of Node.js, in order with console.log ("node"), whole lines to console.log ("console", e.g. DevTools in an Electron renderer), or a function receiving the text
+   * @param {"inherit"|"node"|"console"|Function} [options.stderr="inherit"] - sys.stderr, as stdout ("console": console.error)
    * @param {boolean} [options.synchronousCallbacks=false] - serve native callbacks during interruptible synchronous Python waits
    * @param {number} [options.switchInterval=5] - GIL switch interval in milliseconds (sys.setswitchinterval), as in CPython; a smaller value (0.5) keeps the Node.js event loop responsive while Python threads run CPU-bound code, at the cost of slower contended Python threads
    * @returns {Promise<Python>}
@@ -201,7 +206,7 @@ export class Python {
     if ("nativeObjects" in options) throw new TypeError("options.nativeObjects has been removed: native objects are always enabled; use options.synchronousCallbacks for interruptible synchronous waits");
     const { executable, library = process.env.PYTHON_LIBRARY, stdin = true, stdout = "inherit", stderr = "inherit", synchronousCallbacks = false, switchInterval = 5 } = options;
     for (const [name, value] of Object.entries({ stdout, stderr })) {
-      if (value !== "inherit" && value !== "node" && typeof value !== "function") throw new TypeError(`options.${name} must be "inherit", "node" or a function`);
+      if (value !== "inherit" && value !== "node" && value !== "console" && typeof value !== "function") throw new TypeError(`options.${name} must be "inherit", "node", "console" or a function`);
     }
 
     if (typeof synchronousCallbacks !== "boolean") throw new TypeError("options.synchronousCallbacks must be a boolean");
@@ -296,7 +301,6 @@ export class Python {
           this.#api,
           (ptr) => this.#check(ptr),
           (fn) => this.#withGIL(fn, true),
-          (outcome) => this.#consumeOutcome(outcome),
         ),
     );
     for (const name of [
@@ -438,6 +442,11 @@ export class Python {
     for (const name of ["stdout", "stderr"] as const) {
       const target = streams[name];
       if (target === "inherit") continue;
+      if (target === "console") {
+        const lines = lineWriter(name === "stdout" ? (line) => console.log(line) : (line) => console.error(line));
+        this.#platform.redirect(name, lines.write, lines.flush);
+        continue;
+      }
       const write = target === "node" ? (text: string) => void process[name].write(text) : (text: string) => void target(text);
       this.#platform.redirect(name, write);
     }
@@ -803,25 +812,28 @@ export class Python {
   }
 
   async #nativeCall(name: "PyImport_ImportModule" | "PyObject_Call" | "ExecuteSource", args: unknown[], control?: CallControl): Promise<Pointer> {
-    const { request, task } = this.#withGIL(() => {
-      const request = this.#filled(this.#api.PyTuple_New(args.length + 1), (tuple) => {
-        this.#status(this.#api.PyTuple_SetItem(tuple, 0, this.#toPy(name)));
-        args.forEach((value, i) => {
-          const pointerArgument = name === "ExecuteSource" ? i === 2 : API[name][1][i] === c_void_p;
-          const ptr = pointerArgument && value !== null ? this.#check(typeof value === "bigint" ? value : null) : this.#toPy(value);
-          if (pointerArgument && value !== null) this.#api.Py_IncRef(ptr);
-          this.#status(this.#api.PyTuple_SetItem(tuple, i + 1, ptr));
-        });
-      });
-      try {
-        const task = this.#executor.callAsync(request, control);
-        if (control?.aborted) control.cancel?.();
-        return { request, task };
-      } catch (error) {
-        this.#api.Py_DecRef(request);
-        throw error;
-      }
-    }, true);
+    const request = this.#withGIL(
+      () =>
+        this.#filled(this.#api.PyTuple_New(args.length + 1), (tuple) => {
+          this.#status(this.#api.PyTuple_SetItem(tuple, 0, this.#toPy(name)));
+          args.forEach((value, i) => {
+            const pointerArgument = name === "ExecuteSource" ? i === 2 : API[name][1][i] === c_void_p;
+            const ptr = pointerArgument && value !== null ? this.#check(typeof value === "bigint" ? value : null) : this.#toPy(value);
+            if (pointerArgument && value !== null) this.#api.Py_IncRef(ptr);
+            this.#status(this.#api.PyTuple_SetItem(tuple, i + 1, ptr));
+          });
+        }),
+      true,
+    );
+    // Submitted after releasing the GIL: the executor thread can take it at once.
+    let task: Promise<Pointer>;
+    try {
+      task = this.#executor.callAsync(request, control);
+      if (control?.aborted) control.cancel?.();
+    } catch (error) {
+      this.#withGIL(() => this.#api.Py_DecRef(request), true);
+      throw error;
+    }
     try {
       const outcome = await task;
       return this.#withGIL(() => this.#consumeOutcome(outcome), true);
@@ -1103,7 +1115,7 @@ export class Python {
       if (fields) return this.#takeProxy(this.#conversions.fromTemporal(fields));
     }
     if (value instanceof Uint8Array && !(value instanceof Uint8ClampedArray)) return this.#check(api.PyBytes_FromStringAndSize(Buffer.from(value.buffer, value.byteOffset, value.byteLength), value.byteLength));
-    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || value instanceof SharedArrayBuffer) return this.#memoryview(value);
+    if (ArrayBuffer.isView(value) || isArrayBuffer(value)) return this.#memoryview(value);
     if (typeof value !== "object") throw new TypeError(`Cannot convert a JavaScript ${typeof value} to Python`);
     const proto = Object.getPrototypeOf(value);
     if (!Array.isArray(value) && !(value instanceof Set) && !(value instanceof Map) && proto !== Object.prototype && proto !== null) return this.#jsProxy(value);
@@ -1138,7 +1150,7 @@ export class Python {
 
   /** byReference(value) → new reference. */
   #reference(value: unknown): bigint {
-    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || value instanceof SharedArrayBuffer) return this.#memoryview(value);
+    if (ArrayBuffer.isView(value) || isArrayBuffer(value)) return this.#memoryview(value);
     if (value === null || typeof value !== "object" || this.#states.has(value)) return this.#toPy(value);
     return this.#jsProxy(value);
   }
@@ -1172,7 +1184,7 @@ export class Python {
 
   /** memoryview sharing the memory of a typed array / ArrayBuffer / DataView (new reference). */
   #memoryview(value: ArrayBufferLike | ArrayBufferView): bigint {
-    const view = value instanceof ArrayBuffer || value instanceof SharedArrayBuffer ? new Uint8Array(value) : value;
+    const view = isArrayBuffer(value) ? new Uint8Array(value) : value;
     const bytes = Buffer.from(view.buffer, view.byteOffset, view.byteLength);
     const format = FORMATS[view.constructor.name] ?? "B"; // DataView: bytes
     const address = bytes.length ? addressof(bytes) : 0n;

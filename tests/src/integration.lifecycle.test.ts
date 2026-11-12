@@ -61,6 +61,8 @@ for (const scenario of [
   ...(process.platform === "win32" ? ["dll-directory-startup", "dll-directory-finalize"] : []),
   "startup-early",
   "native-objects-error",
+  "no-shared-array-buffer",
+  "console-output",
   "executor-cache-error",
   "executor-start-error",
   "executor-enqueue-error",

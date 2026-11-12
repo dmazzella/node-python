@@ -34,7 +34,7 @@ subinterpreti o un servizio Python remoto.
 | [host.ts](./src/host.ts)                                                             | Prenotazione esclusiva del thread host nel processo         |
 | [interpreter.ts](./src/interpreter.ts)                                               | Probe, percorsi, ricerca e caricamento della libreria       |
 | [native.ts](./src/native.ts)                                                         | Firme ctypes e strutture della C API                        |
-| [executor.ts](./src/executor.ts)                                                     | Coda delle operazioni native e completamenti                |
+| [executor.ts](./src/executor.ts)                                                     | Executor node-ctypes delle operazioni native                |
 | [bootstrap.ts](./src/bootstrap.ts)                                                   | Namespace privato, wrapper canonico e layout base           |
 | [objects.ts](./src/objects.ts)                                                       | Slot nativi, callable factory e code degli ID rilasciati    |
 | [scheduler.ts](./src/scheduler.ts)                                                   | Await, callback differiti, cancellazione e wakeup           |
@@ -45,11 +45,11 @@ subinterpreti o un servizio Python remoto.
 ```mermaid
 flowchart LR
     HOST["Thread host Node.js: runtime e JavaScript"]
-    EX["Thread Python executor: coda seriale"]
+    EX["Thread executor node-ctypes: coda seriale"]
     LOOP["Thread Python asyncio: coroutine"]
     NOTIFY["Thread Python notifier: eventi dello scheduler"]
     OTHER["Thread Python applicativi"]
-    HOST -->|"enqueue con contesto Python"| EX
+    HOST -->|"callOn senza GIL"| EX
     EX -->|"completamento TSFN"| HOST
     HOST -->|"submit awaitable"| LOOP
     LOOP --> NOTIFY
@@ -63,12 +63,14 @@ L'**host** e il thread JavaScript che inizializza CPython: puo essere il main
 thread Node.js oppure un `worker_threads.Worker`, ma e unico nel processo.
 I proxy non sono trasferibili tra isolate.
 
-L'**executor** e un `threading.Thread` daemon Python, non un worker JavaScript o
-libuv. Esegue in sequenza le operazioni native pubbliche. Il **loop asyncio**,
+L'**executor** e un `Executor` di node-ctypes (thread nativo con coda FIFO), non
+un worker JavaScript o libuv. Esegue in sequenza le operazioni native pubbliche:
+ogni richiesta e la chiamata, su quel thread, di una callback ctypes Python che
+prende il GIL. Il thread tiene un thread state Python dall'avvio alla chiusura. Il **loop asyncio**,
 avviato pigramente in un altro thread daemon, esegue le coroutine.
 Il **notifier** dello scheduler e ancora un thread distinto: consegna eventi
 senza bloccare il loop asyncio nella callback verso Node.
-L'executor usa un proprio canale di completamento, non questo notifier.
+I completamenti dell'executor arrivano dal canale di node-ctypes, non da questo notifier.
 
 Il package usa il node-ctypes pubblicato, senza shim compilati propri.
 I servizi TypeScript invocano C API e libreria standard; restano adattatori
@@ -187,34 +189,41 @@ in [runtime.ts](./src/runtime.ts); `PythonExecutor` in
 sequenceDiagram
     participant JS as Host Node.js
     participant RT as Runtime
-    participant EX as Executor Python
+    participant EX as Executor node-ctypes
     JS->>RT: callable(args), import, exec o eval
-    RT->>RT: Verifica running, conserva riferimenti e converte argomenti
-    RT->>EX: Con contesto Python sull'host, accoda richiesta e token
+    RT->>RT: Con GIL: verifica running, conserva riferimenti, costruisce la richiesta
+    RT->>EX: Senza GIL: callOn(_entry, richiesta, token)
     RT-->>JS: Promise
-    EX->>EX: Esegue e conserva (successo, valore o eccezione)
-    EX->>RT: TSFN con il solo token di completamento
-    RT->>RT: Con GIL sull'host, _take rimuove l'outcome dal registro Python
-    RT->>RT: Consuma outcome, converte o costruisce PythonError
+    EX->>EX: Callback ctypes: prende il GIL, esegue, outcome (successo, valore o eccezione)
+    EX->>RT: Outcome come nuovo riferimento: in linea o dal canale di node-ctypes
+    RT->>RT: Con GIL: consuma outcome, converte o costruisce PythonError
     RT-->>JS: Valore, errore oppure Promise dello scheduler
 ```
 
-La coda e `queue.SimpleQueue`. La richiesta contiene operazione e argomenti;
-le operazioni sono import, esecuzione sorgente e chiamata Python.
-Le tuple mantengono vivi callable e argomenti durante l'attesa.
-Il thread conserva gli outcome in `_completed` finche l'host non li preleva.
-Il callback non trasporta puntatori risultato, ma solo il token.
+La coda e quella dell'`Executor` di node-ctypes (FIFO). La richiesta contiene
+operazione e argomenti; le operazioni sono import, esecuzione sorgente e chiamata
+Python. Le tuple mantengono vivi callable e argomenti durante l'attesa.
+`_entry` e una callback `ctypes.CFUNCTYPE`: ctypes prende il GIL intorno alla
+chiamata e la callback restituisce l'outcome come nuovo riferimento, posseduto
+dall'host (nessun registro Python intermedio). La richiesta viene accodata dopo
+aver rilasciato il GIL: una richiesta breve completa mentre l'host la attende in
+linea (budget per funzione di node-ctypes), le altre tramite il canale di
+completamento di node-ctypes.
+
+Il primo job dell'executor e `PyGILState_Ensure` seguito da `PyEval_SaveThread`:
+il thread state resta associato al thread executor fino alla chiusura, quindi lo
+stato thread-local Python (`threading.local`, contesto `decimal`, ...) sopravvive
+tra le richieste. L'executor usa binding propri di queste funzioni, distinti da
+quelli dell'host.
 
 Gli identificatori sono positivi nel range signed 32 bit. `nextCompletionToken`
 riparte da 1 e salta quelli pendenti; esaurire tutti gli identificatori liberi
 produce un errore, non un riuso ambiguo. Non e un limite al numero cumulativo di
-richieste completate. I riferimenti agli helper vengono risolti prima dell'avvio
-del thread, evitando un executor avviato con cache incompleta.
+richieste completate. Helper e indirizzo di `_entry` vengono risolti prima di
+avviare l'executor: un setup fallito non lascia un thread con un thread state.
 
-Il canale executor e referenziato finche ci sono richieste pendenti e torna
-`unref` quando si svuota. Nessun worker libuv resta in attesa di Python.
-La notifica Python attende comunque il gestore Node: non e lock-free.
-Non esiste backpressure applicativa automatica.
+L'executor tiene vivo il processo solo con richieste pendenti. Nessun worker
+libuv resta in attesa di Python. Non esiste backpressure applicativa automatica.
 
 ### Risultati, namespace e richieste pendenti
 
@@ -625,9 +634,13 @@ Non tutte le conversioni sono simmetriche.
 
 `PythonPlatform` tenta UTF-8 e line buffering sugli stream esistenti, tollerando
 solo gli errori previsti per stream non riconfigurabili.
-`"inherit"` conserva lo stream; `"node"` e i callback installano `JsStream`.
-Il wrapper verifica che `write` riceva testo, chiama JavaScript e restituisce
-la lunghezza del testo. `stdin: false` assegna `sys.stdin = None`.
+`"inherit"` conserva lo stream (senza console e' `None`: riconfigurazione
+saltata, output scartato come in `pythonw`); `"node"`, `"console"` e i
+callback installano `JsStream`. Il wrapper verifica che `write` riceva testo,
+chiama JavaScript e restituisce la lunghezza del testo; `flush` chiama la
+funzione di flush, se presente. `"console"` usa `lineWriter`: accumula fino al
+ritorno a capo e passa righe intere a `console.log`/`console.error`; il resto
+esce con `flush()` o con il flush degli stream a `Py_FinalizeEx`. `stdin: false` assegna `sys.stdin = None`.
 
 I callback di output seguono il percorso del thread Python chiamante.
 Il valore restituito dal writer Node/callback viene scartato: non e implementata
@@ -667,10 +680,13 @@ e restituisce `undefined`; altrimenti viene rilanciato l'errore originale.
 
 `exec`, `eval`, `import` e le chiamate registrano un controllo per la Promise
 restituita; l'executor vi installa `cancel` dopo l'accodamento e lo rimuove al
-completamento. Su abort `run` chiama `_cancel(token)` sotto un lock Python:
+completamento. Su abort:
 
-- richiesta ancora in coda: viene marcata e scartata con `KeyboardInterrupt`
-  senza eseguirla;
+- richiesta ancora nella coda dell'executor: viene tolta dalla coda di node-ctypes
+  (id del job) e completata con `KeyboardInterrupt` senza eseguirla;
+- richiesta gia presa dal thread executor ma non ancora partita (attende il
+  GIL): `_cancel(token)` la marca sotto un lock Python e `_run` solleva
+  `KeyboardInterrupt` senza eseguirla;
 - richiesta in esecuzione: `PyThreadState_SetAsyncExc` inietta
   `KeyboardInterrupt` nel thread executor, al massimo una volta per richiesta;
 - richiesta gia terminata: nessun effetto.
@@ -809,10 +825,9 @@ finalizzazione esplicita viene rifiutata.
    comunque lo stop del loop; il sentinel del notifier e inviato in `finally`.
 5. Il runtime drena riferimenti gia accodati e rilascia l'owner del tipo nativo,
    mantenendo ancora vivi i callback.
-6. `executor.close` attende i suoi pending, accoda il sentinel e ne consuma
-   l'outcome. **La notifica di stop non dimostra che la callback sia ritornata**:
-   controlla `is_alive` cedendo il controllo con `setImmediate`.
-   Solo dopo la fine del thread libera helper, namespace e canale executor.
+6. `executor.close` attende i suoi pending, accoda `PyEval_RestoreThread` e
+   `PyGILState_Release` (il thread state viene rilasciato sul suo thread), chiude
+   l'`Executor` (drain e fine del thread) e solo dopo libera helper e namespace.
 7. Sul thread host originale ripristina il thread state salvato e chiama
    `Py_FinalizeEx` sincrono. Un risultato negativo o non numerico e errore.
 
@@ -849,8 +864,8 @@ Proxy e memoria Python non devono essere usati dopo.
 `beforeExit` chiama la finalizzazione asincrona; un suo errore viene stampato e
 imposta `process.exitCode = 1`.
 `process.exit()` non puo attendere Promise e segue un altro percorso:
-se c'e uno stack Python attivo o lavoro pendente, abbandona l'executor,
-toglie il riferimento al suo canale e conserva gli owner fino all'uscita OS.
+se c'e uno stack Python attivo o lavoro pendente, abbandona l'executor (node-ctypes
+lascia il suo thread all'uscita del processo) e conserva gli owner fino all'uscita OS.
 Non promette cancellazione di codice nativo o cleanup ordinato.
 
 Se l'uscita avviene dentro un callback, `PyEval_SaveThread` viene chiamato

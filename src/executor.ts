@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Damiano Mazzella. MIT License (see LICENSE).
-import { setImmediate } from "node:timers/promises";
-import { c_int, threadSafeCallback } from "node-ctypes";
-import type { ThreadSafeCallbackWrapper } from "node-ctypes";
+import { CFUNCTYPE, Executor, c_int, c_void_p } from "node-ctypes";
+import type { FFIFunction } from "node-ctypes";
 import { Py_file_input } from "./native.ts";
 import type { PythonLibrary } from "./native.ts";
 
@@ -15,23 +14,17 @@ export function nextCompletionToken(previous: number, pending: ReadonlyMap<numbe
   return token;
 }
 
-type Pending = { promise: Promise<Pointer>; resolve: (value: Pointer) => void; reject: (error: unknown) => void; control?: Cancellable };
 /** Filled by the executor while the request is queued or running. */
 export interface Cancellable {
   cancel?: () => void;
 }
-const HELPERS = ["_enqueue", "_take", "_stop_request", "_alive", "_start", "_cancel"] as const;
+const HELPERS = ["_cancel", "_discard", "_cancelled_outcome"] as const;
 type Helper = (typeof HELPERS)[number];
 const SOURCE = `
 import ctypes
 import importlib
-import queue
 import threading
 
-_queue = queue.SimpleQueue()
-_sentinel = object()
-_completed = {}
-_notify = ctypes.CFUNCTYPE(None, ctypes.c_int)(_notify_address)
 _base_error = BaseException
 _interrupt = KeyboardInterrupt
 _compile = compile
@@ -42,12 +35,12 @@ _get_ident = threading.get_ident
 _async_exc = ctypes.cast(ctypes.pythonapi.PyThreadState_SetAsyncExc, ctypes.c_void_p).value
 _raise_async = ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.c_ulong, ctypes.py_object)(_async_exc)
 _clear_async = ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)(_async_exc)
+_incref = ctypes.PYFUNCTYPE(None, ctypes.py_object)(ctypes.cast(ctypes.pythonapi.Py_IncRef, ctypes.c_void_p).value)
 # Reentrant only for _is_owned(): see _settle.
 _lock = threading.RLock()
 _ident = None
 _current = None
 _interrupted = False
-_waiting = set()
 _cancelled = set()
 
 def _execute(request):
@@ -67,7 +60,6 @@ def _execute(request):
 def _run(request, token):
     global _current, _interrupted
     with _lock:
-        _waiting.discard(token)
         if token in _cancelled:
             _cancelled.discard(token)
             raise _interrupt
@@ -95,83 +87,77 @@ def _settle():
                 _lock.release()
 
 def _cancel(token):
-    # Inject at most once, and only into the operation that is running: a
-    # late interrupt can leave _current stale, never pending for the next one.
+    # Inject at most once, and only into the operation that is running. A
+    # request already taken by the executor thread but not started yet (it
+    # waits for the GIL) is marked: _run raises before executing it.
     global _interrupted
     with _lock:
         if token == _current:
             if not _interrupted:
                 _interrupted = True
                 _raise_async(_ident, _interrupt)
-        elif token in _waiting:
+        else:
             _cancelled.add(token)
 
-def _enqueue(request, token):
+def _discard(token):
+    # A cancellation that arrived after its request completed.
     with _lock:
-        _waiting.add(token)
-    _queue.put((request, token))
+        _cancelled.discard(token)
 
-def _stop_request(token):
-    _queue.put((_sentinel, token))
+def _cancelled_outcome():
+    return (False, _interrupt())
 
-def _take(token):
-    return _completed.pop(token)
-
-def _alive():
-    return _thread.is_alive()
-
-def _start():
-    _thread.start()
-
-def _work():
+def _entry(request, token):
+    # Runs on the executor thread; ctypes takes the GIL around the callback.
+    # The outcome is returned as a new reference, owned by the host.
     global _ident
     _ident = _get_ident()
-    while True:
-        request, token = _queue.get()
-        stopping = request is _sentinel
-        try:
-            outcome = (True, None if stopping else _run(request, token))
-        except _base_error as error:
-            outcome = (False, error)
-        _completed[token] = outcome
-        del request, outcome
-        _notify(token)
-        del token
-        if stopping:
-            return
+    try:
+        outcome = (True, _run(request, token))
+    except _base_error as error:
+        outcome = (False, error)
+    _incref(outcome)
+    return id(outcome)
 
-_thread = threading.Thread(target=_work, name="node-python", daemon=True)
+_entry_callback = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.py_object, ctypes.c_int)(_entry)
+_entry_address = ctypes.cast(_entry_callback, ctypes.c_void_p).value
 `;
 
-/** Python owns execution; completion notifications do not occupy libuv workers. */
+// Rejection reason of a request removed from the queue before it ran.
+const CANCELLED = Symbol("cancelled");
+// node-ctypes internals, not part of its typed API: the id of a call (written
+// into a callOn target with `_job`) and the removal of a call still queued.
+type ExecutorJobs = { _cancel(job: number, reason: unknown): boolean };
+
+/**
+ * Python requests run in order on a node-ctypes Executor thread (no libuv
+ * worker waits for them). Each request is a call of a Python ctypes callback
+ * on that thread; the thread keeps one Python thread state from start to close.
+ */
 export class PythonExecutor {
   #api: PythonLibrary;
   #namespace!: bigint;
-  #channel!: ThreadSafeCallbackWrapper;
   #check: (ptr: Pointer) => bigint;
   #withGIL: <T>(fn: () => T) => T;
-  #consume: (outcome: Pointer) => Pointer;
   #helpers = new Map<Helper, bigint>();
-  #pending = new Map<number, Pending>();
+  #executor!: Executor;
+  #entry!: FFIFunction;
+  #restoreThread!: FFIFunction;
+  #releaseState!: FFIFunction;
+  #attached!: Promise<[number, Pointer]>;
+  #pending = new Map<number, Promise<unknown>>();
   #lastToken = 0;
   #closing: Promise<void> | undefined;
   #abandoned = false;
 
-  constructor(api: PythonLibrary, check: (ptr: Pointer) => bigint, withGIL: <T>(fn: () => T) => T, consume: (outcome: Pointer) => Pointer) {
+  constructor(api: PythonLibrary, check: (ptr: Pointer) => bigint, withGIL: <T>(fn: () => T) => T) {
     this.#api = api;
     this.#check = check;
     this.#withGIL = withGIL;
-    this.#consume = consume;
+    let entry: bigint;
     try {
       this.#namespace = check(api.PyDict_New());
-      this.#channel = threadSafeCallback((token) => this.#complete(token), null, [c_int]).unref();
       if (api.PyDict_SetItemString(this.#namespace, "__builtins__", api.PyEval_GetBuiltins()) < 0) check(null);
-      const address = check(api.PyLong_FromLongLong(this.#channel.pointer));
-      try {
-        if (api.PyDict_SetItemString(this.#namespace, "_notify_address", address) < 0) check(null);
-      } finally {
-        api.Py_DecRef(address);
-      }
       const code = check(api.Py_CompileString(SOURCE, "<node-python executor>", Py_file_input));
       try {
         api.Py_DecRef(check(api.PyEval_EvalCode(code, this.#namespace, this.#namespace)));
@@ -183,25 +169,72 @@ export class PythonExecutor {
         api.Py_IncRef(helper);
         this.#helpers.set(name, helper);
       }
-      api.Py_DecRef(this.#call("_start"));
+      entry = BigInt(api.PyLong_AsLongLong(check(api.PyDict_GetItemString(this.#namespace, "_entry_address"))));
     } catch (error) {
       this.#releasePython();
-      this.#channel?.release();
       throw error;
     }
+    // Started only once the Python side is complete: a failed setup leaves no
+    // thread holding a thread state. Own bindings: the host's wrappers count
+    // as host acquisitions (and tests replace them).
+    this.#executor = new Executor({ name: "node-python" });
+    this.#entry = CFUNCTYPE(c_void_p, c_void_p, c_int)(entry);
+    this.#restoreThread = api.func("PyEval_RestoreThread", null, [c_void_p]);
+    this.#releaseState = api.func("PyGILState_Release", null, [c_int]);
+    // The first jobs give the executor thread a thread state and release the
+    // GIL: thread-local Python state survives between requests.
+    const ensure = api.func("PyGILState_Ensure", c_int, []).callOn(this.#executor) as Promise<number>;
+    const save = api.func("PyEval_SaveThread", c_void_p, []).callOn(this.#executor) as Promise<Pointer>;
+    this.#attached = Promise.all([ensure, save]);
+    this.#attached.catch(() => undefined);
   }
 
   callAsync(request: Pointer, control?: Cancellable): Promise<Pointer> {
     if (this.#abandoned || this.#closing) return Promise.reject(new Error("Python executor is closing"));
-    return this.#dispatch(request, false, control);
+    let token: number;
+    try {
+      token = nextCompletionToken(this.#lastToken, this.#pending);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    this.#lastToken = token;
+    // Submitted without the GIL held by the host: the executor thread takes it
+    // at once, and a short request completes while the host waits inline.
+    const call = { executor: this.#executor, _job: 0 };
+    const task = this.#entry.callOn(call, request, token) as Promise<Pointer>;
+    const job = call._job;
+    let cancelled = false;
+    if (control)
+      control.cancel = () => {
+        if (cancelled || this.#abandoned) return;
+        cancelled = true;
+        // Still queued: removed without running. Otherwise Python interrupts it.
+        if (!(this.#executor as unknown as ExecutorJobs)._cancel(job, CANCELLED)) this.#tokenHelper("_cancel", token);
+      };
+    const settled = task
+      .then(
+        (outcome) => {
+          if (cancelled) this.#tokenHelper("_discard", token);
+          return outcome;
+        },
+        (error: unknown) => {
+          if (error === CANCELLED) return this.#withGIL(() => this.#call("_cancelled_outcome"));
+          throw error;
+        },
+      )
+      .finally(() => {
+        if (control) control.cancel = undefined;
+        this.#pending.delete(token);
+      });
+    this.#pending.set(token, settled);
+    return settled;
   }
 
-  #cancel(token: number): void {
-    if (this.#abandoned || !this.#pending.has(token)) return;
+  #tokenHelper(name: Helper, token: number): void {
     this.#withGIL(() => {
       const id = this.#check(this.#api.PyLong_FromLongLong(token));
       try {
-        this.#api.Py_DecRef(this.#call("_cancel", [id]));
+        this.#api.Py_DecRef(this.#call(name, [id]));
       } finally {
         this.#api.Py_DecRef(id);
       }
@@ -229,97 +262,28 @@ export class PythonExecutor {
     if (this.#namespace) this.#api.Py_DecRef(this.#namespace);
   }
 
-  #dispatch(request: Pointer, stopping = false, control?: Cancellable): Promise<Pointer> {
-    let token: number;
-    try {
-      token = nextCompletionToken(this.#lastToken, this.#pending);
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    this.#lastToken = token;
-    let resolve!: Pending["resolve"];
-    let reject!: Pending["reject"];
-    const promise = new Promise<Pointer>((ok, fail) => {
-      resolve = ok;
-      reject = fail;
-    });
-    this.#pending.set(token, { promise, resolve, reject, control });
-    if (this.#pending.size === 1) this.#channel.ref();
-    try {
-      this.#withGIL(() => {
-        const id = this.#check(this.#api.PyLong_FromLongLong(token));
-        try {
-          this.#api.Py_DecRef(this.#call(stopping ? "_stop_request" : "_enqueue", stopping ? [id] : [request, id]));
-        } finally {
-          this.#api.Py_DecRef(id);
-        }
-      });
-      if (control) control.cancel = () => this.#cancel(token);
-    } catch (error) {
-      this.#pending.delete(token);
-      if (this.#pending.size === 0) this.#channel.unref();
-      reject(error);
-    }
-    return promise;
-  }
-
-  #complete(token: number): void {
-    if (this.#abandoned) return;
-    const pending = this.#pending.get(token);
-    if (!pending) throw new Error(`Unknown Python executor completion: ${token}`);
-    this.#pending.delete(token);
-    if (pending.control) pending.control.cancel = undefined;
-    try {
-      const outcome = this.#withGIL(() => {
-        const id = this.#check(this.#api.PyLong_FromLongLong(token));
-        try {
-          return this.#call("_take", [id]);
-        } finally {
-          this.#api.Py_DecRef(id);
-        }
-      });
-      pending.resolve(outcome);
-    } catch (error) {
-      pending.reject(error);
-    } finally {
-      if (this.#pending.size === 0) this.#channel.unref();
-    }
-  }
-
   close(): Promise<void> {
     this.#closing ??= this.#finish();
     return this.#closing;
   }
 
   async #finish(): Promise<void> {
-    await Promise.allSettled([...this.#pending.values()].map(({ promise }) => promise));
-    const outcome = await this.#dispatch(null, true);
+    await Promise.allSettled([...this.#pending.values()]);
     try {
-      this.#withGIL(() => this.#api.Py_DecRef(this.#consume(outcome)));
+      const [state, threadState] = await this.#attached;
+      // FIFO, after every accepted request: the thread state is released on
+      // its own thread, then the thread stops.
+      await this.#restoreThread.callOn(this.#executor, threadState);
+      await this.#releaseState.callOn(this.#executor, state);
     } finally {
-      // A completion can arrive before its native callback returns on Python.
-      while (
-        this.#withGIL(() => {
-          const alive = this.#call("_alive");
-          try {
-            const result = this.#api.PyObject_IsTrue(alive);
-            if (result < 0) this.#check(null);
-            return result !== 0;
-          } finally {
-            this.#api.Py_DecRef(alive);
-          }
-        })
-      ) {
-        await setImmediate();
-      }
+      await this.#executor.close();
       this.#withGIL(() => this.#releasePython());
-      this.#channel.release();
     }
   }
 
   abandon(): void {
-    // Forced exit retains Python/callback owners until the OS tears down the process.
+    // Forced exit retains Python owners until the OS tears down the process;
+    // node-ctypes leaves the executor thread to the process exit.
     this.#abandoned = true;
-    this.#channel.unref();
   }
 }

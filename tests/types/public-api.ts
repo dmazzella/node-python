@@ -11,6 +11,9 @@ const python = await Python.initialize({
 });
 
 const answer: number = await python.eval<number>("6 * 7");
+await Python.initialize({ stdout: "console", stderr: "console" });
+// @ts-expect-error stdout accepts "inherit", "node", "console" or a function
+await Python.initialize({ stdout: "devtools" });
 await Python.initialize({ synchronousCallbacks: true });
 await Python.initialize({ synchronousCallbacks: false });
 await Python.initialize({ switchInterval: 0.5 });

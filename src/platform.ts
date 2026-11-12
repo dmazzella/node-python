@@ -7,9 +7,11 @@ const PLATFORM_ADAPTERS = `
 class JsStream(io.TextIOBase):
     encoding = "utf-8"
     errors = "strict"
-    def __init__(self, name, write):
-        self.name, self._write = name, write
+    def __init__(self, name, write, flush=None):
+        self.name, self._write, self._flush = name, write, flush
     def writable(self): return True
+    def flush(self):
+        if self._flush is not None: self._flush()
     def write(self, text):
         if not isinstance(text, str):
             raise TypeError(f"write() argument must be str, not {type(text).__name__}")
@@ -28,6 +30,8 @@ export class PythonPlatform {
     module.io = importModule("io");
     definePython(builtins, module, PLATFORM_ADAPTERS, "<node-python stream and timer adapters>");
     for (const stream of [this.#sys.stdout, this.#sys.stderr]) {
+      // None without a console (an Electron renderer, a packaged GUI app on Windows).
+      if (stream === null) continue;
       try {
         stream.reconfigure(kwargs({ encoding: "utf-8", line_buffering: true }));
       } catch (error) {
@@ -37,7 +41,29 @@ export class PythonPlatform {
     }
   }
 
-  redirect(name: "stdout" | "stderr", write: (text: string) => void): void {
-    this.#sys[name] = this.#module.JsStream(`<node ${name}>`, write);
+  redirect(name: "stdout" | "stderr", write: (text: string) => void, flush?: () => void): void {
+    this.#sys[name] = this.#module.JsStream(`<node ${name}>`, write, flush ?? null);
   }
+}
+
+/**
+ * Whole lines for `emit` (e.g. console.log) from text written in pieces:
+ * `print("a", "b")` writes "a", " ", "b", "\n". A line without its newline
+ * is emitted by `flush` (Python's flush(), and the flush at finalization).
+ */
+export function lineWriter(emit: (line: string) => void): { write: (text: string) => void; flush: () => void } {
+  let pending = "";
+  return {
+    write(text) {
+      const lines = (pending + text).split("\n");
+      pending = lines.pop()!;
+      for (const line of lines) emit(line);
+    },
+    flush() {
+      if (!pending) return;
+      const line = pending;
+      pending = "";
+      emit(line);
+    },
+  };
 }

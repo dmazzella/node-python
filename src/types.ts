@@ -29,7 +29,7 @@ export type PyObject = PythonObject;
 type Float16ArrayIfAvailable = typeof globalThis extends { Float16Array: abstract new (...args: never) => infer T } ? T : never;
 export type PythonTypedArray = Int8Array | Uint8Array | Uint8ClampedArray | Int16Array | Uint16Array | Int32Array | Uint32Array | Float16ArrayIfAvailable | Float32Array | Float64Array | BigInt64Array | BigUint64Array;
 
-export type OutputTarget = "inherit" | "node" | ((text: string) => unknown);
+export type OutputTarget = "inherit" | "node" | "console" | ((text: string) => unknown);
 export interface StreamOptions {
   stdin: boolean;
   stdout: OutputTarget;

@@ -69,7 +69,12 @@ returns the runtime singleton. Options apply to the first initialization.
   interpreter supplies `sys.path`, including virtualenv paths. Each discovery
   probe has a 10-second timeout.
 - `stdin: false` leaves standard input to Node.js. `stdout` and `stderr` accept
-  `"inherit"` (default), `"node"` or a text callback.
+  `"inherit"` (default), `"node"`, `"console"` or a text callback. `"console"`
+  sends whole lines to `console.log` / `console.error` (a line without its newline
+  on `flush()` or at finalization). Without a console, as in an Electron renderer
+  or a packaged GUI app on Windows, Python's `sys.stdout` and `sys.stderr` are
+  `None` and `"inherit"` discards the output, as `pythonw` does: use `"console"`
+  (DevTools) or a callback (e.g. a log file).
 - `synchronousCallbacks: true` enables native callback dispatch during
   interruptible synchronous Python waits. It requires an available SIGURG wakeup
   on POSIX, or Windows Python 3.14+ with its interrupt event available.
@@ -110,9 +115,12 @@ Python types at runtime.
 
 **Calls are asynchronous; live access is synchronous.** Python functions, methods,
 classes and builtins return Promises, including `await new cls(...)`.
-Calls, imports, `exec` and `eval` execute on one Python-owned thread without
-occupying a waiting libuv worker. Arguments and results are converted on Node.js.
-Attributes, indices, assignment, enumeration, ordinary iteration, conversion and
+Calls, imports, `exec` and `eval` execute in order on one native thread (a
+node-ctypes `Executor`) without occupying a waiting libuv worker. Arguments and
+results are converted on Node.js, so thousands of concurrent calls (e.g.
+`Promise.all` over an array) hold Node.js while they are submitted and while
+their results are converted: pass the data to one Python call instead, or host
+Python in a worker (`examples/worker.ts`). Attributes, indices, assignment, enumeration, ordinary iteration, conversion and
 disposal remain synchronous and can block Node.js. Native initialization and
 finalization also run synchronously on the hosting Node.js thread.
 
@@ -204,6 +212,14 @@ CPython. Typechecks include sources, examples and test helpers.
 to change its duration. Both are opt-in, force GC in isolated children and report
 memory/latency diagnostics, not performance or leak-certification guarantees.
 The runtime does not impose application backpressure.
+
+Two manual checks run in Electron's main process after `npm run build`
+(`electron <file>`, with `ELECTRON_RUN_AS_NODE` unset):
+[tests/electron/main.mjs](./tests/electron/main.mjs) prints a JSON report of
+calls, a free UI thread during a long call and bursts of calls;
+[tests/electron/ui/main.mjs](./tests/electron/ui/main.mjs) opens a window that
+charts frame times and main-process IPC latency while bursts run in the main
+process or in the renderer (`--auto` runs both, prints the table and quits).
 
 The [CI workflow](./.github/workflows/ci.yml) runs `npm test` with Python
 3.12, 3.13, 3.14, 3.14t and 3.15 on Windows, Linux and macOS. It is discovered only when

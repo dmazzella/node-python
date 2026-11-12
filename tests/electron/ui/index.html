@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'" />
+    <title>node-python burst check</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --page: #f9f9f7;
+        --surface: #fcfcfb;
+        --ink: #0b0b0b;
+        --ink-2: #52514e;
+        --muted: #898781;
+        --grid: #e1e0d9;
+        --axis: #c3c2b7;
+        --border: rgba(11, 11, 11, 0.1);
+        --series: #2a78d6;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --page: #0d0d0d;
+          --surface: #1a1a19;
+          --ink: #f0efec;
+          --ink-2: #c3c2b7;
+          --muted: #898781;
+          --grid: #2c2c2a;
+          --axis: #383835;
+          --border: rgba(255, 255, 255, 0.1);
+          --series: #3d8be8;
+        }
+      }
+      body {
+        margin: 0;
+        padding: 16px 20px;
+        background: var(--page);
+        color: var(--ink);
+        font:
+          13px/1.4 system-ui,
+          sans-serif;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0;
+      }
+      .sub {
+        color: var(--ink-2);
+        margin: 2px 0 12px;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      button,
+      select {
+        font: inherit;
+        padding: 4px 10px;
+      }
+      .status {
+        color: var(--ink-2);
+      }
+      .animation {
+        position: relative;
+        height: 36px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        margin-bottom: 12px;
+        overflow: hidden;
+      }
+      .box {
+        position: absolute;
+        top: 8px;
+        left: 0;
+        width: 20px;
+        height: 20px;
+        border-radius: 4px;
+        background: var(--series);
+      }
+      .spinner {
+        position: absolute;
+        right: 10px;
+        top: 7px;
+        width: 18px;
+        height: 18px;
+        border: 2px solid var(--axis);
+        border-top-color: var(--ink-2);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .legend-note {
+        position: absolute;
+        left: 50%;
+        top: 9px;
+        transform: translateX(-50%);
+        color: var(--muted);
+        font-size: 12px;
+        pointer-events: none;
+      }
+      .chart {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px 10px 4px;
+        margin-bottom: 10px;
+        position: relative;
+      }
+      .chart h2 {
+        font-size: 13px;
+        margin: 0;
+      }
+      .chart p {
+        margin: 0 0 4px;
+        color: var(--ink-2);
+        font-size: 12px;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 130px;
+      }
+      .tooltip {
+        position: absolute;
+        pointer-events: none;
+        background: var(--surface);
+        color: var(--ink);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 2px 6px;
+        font-size: 12px;
+        display: none;
+        white-space: nowrap;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font-variant-numeric: tabular-nums;
+      }
+      th,
+      td {
+        text-align: right;
+        padding: 4px 8px;
+        border-bottom: 1px solid var(--grid);
+      }
+      th:first-child,
+      td:first-child {
+        text-align: left;
+      }
+      th {
+        color: var(--ink-2);
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <h1 id="title">node-python burst check</h1>
+    <div class="sub" id="info">loading…</div>
+
+    <div class="controls">
+      <label
+        >Calls
+        <select id="count">
+          <option>1000</option>
+          <option selected>5000</option>
+          <option>20000</option>
+        </select></label
+      >
+      <button id="main">Burst in the main process</button>
+      <button id="renderer">Burst in this renderer</button>
+      <span class="status" id="status"></span>
+    </div>
+
+    <div class="animation" aria-hidden="true">
+      <div class="box" id="box"></div>
+      <span class="legend-note">box: requestAnimationFrame · spinner: CSS (compositor)</span>
+      <div class="spinner"></div>
+    </div>
+
+    <div class="chart">
+      <h2>Time between rendered frames (this renderer)</h2>
+      <p>Last 8 s. Spikes above the 16.7 ms line are dropped frames: the box jumps.</p>
+      <canvas id="frames"></canvas>
+      <div class="tooltip" id="frames-tip"></div>
+    </div>
+    <div class="chart">
+      <h2>IPC round trip to the main process</h2>
+      <p>Last 8 s, one ping every 16 ms. Spikes mean the main process (window, menus, IPC) was not responding.</p>
+      <canvas id="ipc"></canvas>
+      <div class="tooltip" id="ipc-tip"></div>
+    </div>
+
+    <table aria-label="Bursts">
+      <thead>
+        <tr>
+          <th>Burst</th>
+          <th>Calls</th>
+          <th>Submit (ms)</th>
+          <th>Settle (ms)</th>
+          <th>Longest frame (ms)</th>
+          <th>Longest IPC (ms)</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+
+    <script type="module">
+      const WINDOW_MS = 8000;
+      const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      const series = { frames: [], ipc: [] };
+      let measuring = null;
+
+      const record = (name, value) => {
+        const now = performance.now();
+        series[name].push({ t: now, v: value });
+        while (series[name].length && series[name][0].t < now - WINDOW_MS) series[name].shift();
+        if (measuring) measuring[name] = Math.max(measuring[name], value);
+      };
+
+      // Rendering: frame intervals and the moving box.
+      let lastFrame = performance.now();
+      const box = document.getElementById("box");
+      const frame = (now) => {
+        record("frames", now - lastFrame);
+        lastFrame = now;
+        const track = box.parentElement.clientWidth - 20;
+        const position = (now / 3) % (2 * track);
+        box.style.transform = `translateX(${position < track ? position : 2 * track - position}px)`;
+        draw("frames");
+        draw("ipc");
+        requestAnimationFrame(frame);
+      };
+      requestAnimationFrame(frame);
+
+      // The main process: a ping every 16 ms.
+      (async () => {
+        for (;;) {
+          const started = performance.now();
+          await window.demo.ping();
+          record("ipc", performance.now() - started);
+          await new Promise((resolve) => setTimeout(resolve, 16));
+        }
+      })();
+
+      // One chart per measure, same y scale (ms): 0..max(50, peak), 16.7 ms reference line.
+      function draw(name) {
+        const canvas = document.getElementById(name);
+        const ratio = devicePixelRatio;
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        if (canvas.width !== width * ratio) {
+          canvas.width = width * ratio;
+          canvas.height = height * ratio;
+        }
+        const g = canvas.getContext("2d");
+        g.setTransform(ratio, 0, 0, ratio, 0, 0);
+        g.clearRect(0, 0, width, height);
+        const left = 36;
+        const bottom = height - 14;
+        const now = performance.now();
+        const peak = Math.max(...series.frames.map((p) => p.v), ...series.ipc.map((p) => p.v), 50);
+        const top = Math.ceil(peak / 50) * 50;
+        const y = (v) => bottom - (Math.min(v, top) / top) * (bottom - 6);
+        const x = (t) => left + ((t - (now - WINDOW_MS)) / WINDOW_MS) * (width - left - 4);
+        g.font = "11px system-ui, sans-serif";
+        g.fillStyle = css("--muted");
+        g.textAlign = "right";
+        g.lineWidth = 1;
+        for (const tick of [0, top / 2, top]) {
+          g.strokeStyle = tick === 0 ? css("--axis") : css("--grid");
+          g.beginPath();
+          g.moveTo(left, Math.round(y(tick)) + 0.5);
+          g.lineTo(width - 4, Math.round(y(tick)) + 0.5);
+          g.stroke();
+          g.fillText(`${tick}`, left - 6, y(tick) + 4);
+        }
+        g.setLineDash([3, 3]);
+        g.strokeStyle = css("--muted");
+        g.beginPath();
+        g.moveTo(left, Math.round(y(16.7)) + 0.5);
+        g.lineTo(width - 4, Math.round(y(16.7)) + 0.5);
+        g.stroke();
+        g.setLineDash([]);
+        g.textAlign = "left";
+        g.fillText("16.7 ms", left + 4, y(16.7) - 4);
+        g.fillText("ms", 2, 10);
+        g.strokeStyle = css("--series");
+        g.lineWidth = 2;
+        g.lineJoin = "round";
+        g.beginPath();
+        series[name].forEach((p, i) => (i ? g.lineTo(x(p.t), y(p.v)) : g.moveTo(x(p.t), y(p.v))));
+        g.stroke();
+        canvas.dataset.left = left;
+      }
+
+      // Hover readout: the sample under the pointer.
+      for (const name of ["frames", "ipc"]) {
+        const canvas = document.getElementById(name);
+        const tip = document.getElementById(`${name}-tip`);
+        canvas.addEventListener("mousemove", (event) => {
+          const rect = canvas.getBoundingClientRect();
+          const left = Number(canvas.dataset.left);
+          const t = performance.now() - WINDOW_MS + ((event.clientX - rect.left - left) / (rect.width - left - 4)) * WINDOW_MS;
+          const nearest = series[name].reduce((best, p) => (!best || Math.abs(p.t - t) < Math.abs(best.t - t) ? p : best), null);
+          if (!nearest) return;
+          tip.textContent = `${nearest.v.toFixed(1)} ms, ${((performance.now() - nearest.t) / 1000).toFixed(1)} s ago`;
+          tip.style.display = "block";
+          tip.style.left = `${event.clientX - rect.left + 18}px`;
+          tip.style.top = `${event.clientY - rect.top + 10}px`;
+        });
+        canvas.addEventListener("mouseleave", () => (tip.style.display = "none"));
+      }
+
+      // Bursts: measured from the click to 300 ms after they settle.
+      let burstNumber = 0;
+      async function run(where) {
+        const count = Number(document.getElementById("count").value);
+        const status = document.getElementById("status");
+        for (const button of document.querySelectorAll("button")) button.disabled = true;
+        status.textContent = `${count} calls in the ${where}…`;
+        measuring = { frames: 0, ipc: 0 };
+        let result;
+        try {
+          result = where === "main process" ? await window.demo.mainBurst(count) : await window.demo.rendererBurst(count);
+        } catch (error) {
+          status.textContent = String(error);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const peaks = measuring;
+        measuring = null;
+        if (result) {
+          const row = document.createElement("tr");
+          for (const value of [`#${++burstNumber} ${where}`, count, result.submitMs, result.settleMs, peaks.frames.toFixed(0), peaks.ipc.toFixed(0)]) {
+            const cell = document.createElement("td");
+            cell.textContent = value;
+            row.append(cell);
+          }
+          document.getElementById("rows").prepend(row);
+          status.textContent = "";
+        }
+        for (const button of document.querySelectorAll("button")) button.disabled = false;
+      }
+      document.getElementById("main").addEventListener("click", () => run("main process"));
+      document.getElementById("renderer").addEventListener("click", () => run("renderer"));
+
+      const info = await window.demo.info();
+      document.title = info.label;
+      document.getElementById("title").textContent = info.label;
+      document.getElementById("info").textContent = `node-ctypes ${info.version} · ${info.nodeCtypes} · Electron ${info.electron} · Python ${info.python}`;
+    </script>
+  </body>
+</html>

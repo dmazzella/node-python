@@ -160,7 +160,7 @@ synchronous_wait = SynchronousWait()
   Object.defineProperty(PythonLibrary.prototype, operation, {
     configurable: true,
     value: (...args: Parameters<typeof lookup>) => {
-      if (operation === "PyObject_Call" || args[1] === "_take") throw failure;
+      if (operation === "PyObject_Call" || args[1] === "_entry_address") throw failure;
       return lookup(...args);
     },
   });
@@ -178,14 +178,19 @@ synchronous_wait = SynchronousWait()
   const python = await Python.initialize({ stdin: false });
   await python.exec("executor_failure_was_run = False");
   const failure = new Error(`Injected ${scenario} failure`);
-  const failingCall = scenario === "executor-enqueue-error" ? 1 : 2;
-  let calls = 0;
-  const original = lib.PyObject_Call;
-  Object.defineProperty(PythonLibrary.prototype, "PyObject_Call", {
+  // Enqueue: building the request tuple, before the executor accepts it.
+  // Completion: reading the outcome tuple, after Python ran the request.
+  const operation = scenario === "executor-enqueue-error" ? "PyTuple_New" : "PyTuple_Size";
+  const original = lib[operation];
+  let failed = false;
+  Object.defineProperty(PythonLibrary.prototype, operation, {
     configurable: true,
-    value: (...args: Parameters<typeof original>) => {
-      if (++calls === failingCall) throw failure;
-      return original(...args);
+    value: (...args: unknown[]) => {
+      if (!failed) {
+        failed = true;
+        throw failure;
+      }
+      return Reflect.apply(original, undefined, args);
     },
   });
   try {
@@ -193,11 +198,58 @@ synchronous_wait = SynchronousWait()
       () => python.exec("executor_failure_was_run = True"),
       (error: unknown) => error === failure,
     );
-    Reflect.deleteProperty(PythonLibrary.prototype, "PyObject_Call");
+    Reflect.deleteProperty(PythonLibrary.prototype, operation);
     assert.equal(python.main.executor_failure_was_run, scenario === "executor-completion-error", "only a completion failure may occur after accepted Python work has executed");
     assert.equal(await python.eval("6 * 7"), 42, "a notification failure must reject its request without stranding later work");
   } finally {
-    Reflect.deleteProperty(PythonLibrary.prototype, "PyObject_Call");
+    Reflect.deleteProperty(PythonLibrary.prototype, operation);
+    await python.finalize();
+  }
+} else if (scenario === "console-output") {
+  // Whole lines to console.log / console.error, as Python writes them in pieces.
+  const logged: string[] = [];
+  const errors: string[] = [];
+  mock.method(console, "log", (line: string) => void logged.push(line));
+  mock.method(console, "error", (line: string) => void errors.push(line));
+  try {
+    const python = await Python.initialize({ stdin: false, stdout: "console", stderr: "console" });
+    try {
+      await python.exec(String.raw`
+import sys
+print("a", "b")
+print("one\ntwo")
+print("partial", end="")
+sys.stdout.flush()
+print("err", file=sys.stderr)
+print("tail", end="")
+`);
+      assert.deepEqual(logged, ["a b", "one", "two", "partial"]);
+      assert.deepEqual(errors, ["err"]);
+    } finally {
+      await python.finalize();
+    }
+    assert.deepEqual(logged, ["a b", "one", "two", "partial", "tail"], "the pending line is emitted when Python finalizes");
+  } finally {
+    mock.restoreAll();
+  }
+} else if (scenario === "no-shared-array-buffer") {
+  // As in a page that is not cross-origin isolated (an Electron renderer):
+  // memory is still passed as ArrayBuffer and typed arrays.
+  Reflect.deleteProperty(globalThis, "SharedArrayBuffer");
+  const python = await Python.initialize({ stdin: false });
+  try {
+    const { len, bytes } = python.builtins;
+    assert.equal(await len(new ArrayBuffer(4)), 4);
+    assert.equal(await len(new Float64Array(3)), 3);
+    assert.deepEqual([...(await bytes(new Uint8Array([1, 2, 3])))], [1, 2, 3]);
+    await python.exec(`
+def fill(view):
+    view[0] = 7
+`);
+    const shared = new Uint8Array(2);
+    await python.main.fill(byReference(shared.buffer));
+    assert.equal(shared[0], 7, "byReference shares the ArrayBuffer memory");
+  } finally {
     await python.finalize();
   }
 } else if (scenario === "native-objects-error") {
