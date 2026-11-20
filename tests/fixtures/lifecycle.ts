@@ -174,48 +174,59 @@ synchronous_wait = SynchronousWait()
   } finally {
     Reflect.deleteProperty(PythonLibrary.prototype, operation);
   }
-} else if (scenario === "executor-enqueue-error" || scenario === "executor-completion-error") {
+} else if (scenario === "executor-enqueue-error") {
+  const allocate = lib.PyTuple_New;
+  const noMemory = lib.func("PyErr_NoMemory", c_void_p, []);
+  let failNextAllocation = false;
+  // Install before initialize(): the library binds and caches its functions on first lookup.
+  Object.defineProperty(PythonLibrary.prototype, "PyTuple_New", {
+    configurable: true,
+    value: (size: Parameters<typeof allocate>[0]) => {
+      if (!failNextAllocation) return allocate(size);
+      failNextAllocation = false;
+      return noMemory();
+    },
+  });
+  try {
+    const python = await Python.initialize({ stdin: false });
+    try {
+      await python.exec("executor_failure_was_run = False");
+      failNextAllocation = true;
+      await assert.rejects(
+        () => python.exec("executor_failure_was_run = True"),
+        (error: unknown) => error instanceof PythonError && error.type === "MemoryError",
+      );
+      assert.equal(failNextAllocation, false, "the native allocation failure was exercised");
+      assert.equal(python.main.executor_failure_was_run, false);
+      assert.equal(await python.eval("6 * 7"), 42);
+    } finally {
+      await python.finalize();
+    }
+  } finally {
+    Reflect.deleteProperty(PythonLibrary.prototype, "PyTuple_New");
+  }
+} else if (scenario === "executor-completion-error") {
   const python = await Python.initialize({ stdin: false });
   await python.exec("executor_failure_was_run = False");
   const failure = new Error(`Injected ${scenario} failure`);
-  let failed = false;
-  // Enqueue: building the request tuple, before the executor accepts it.
-  const original = lib.PyTuple_New;
-  if (scenario === "executor-enqueue-error") {
-    Object.defineProperty(PythonLibrary.prototype, "PyTuple_New", {
-      configurable: true,
-      value: (...args: unknown[]) => {
-        if (!failed) {
-          failed = true;
-          throw failure;
-        }
-        return Reflect.apply(original, undefined, args);
-      },
-    });
-  }
-  // Completion: the executor's outcome fails after Python ran the request.
   const callAsync = PythonExecutor.prototype.callAsync;
-  if (scenario === "executor-completion-error") {
-    mock.method(PythonExecutor.prototype, "callAsync", function (this: PythonExecutor, ...args: Parameters<typeof callAsync>) {
-      const outcome = Reflect.apply(callAsync, this, args);
-      if (failed) return outcome;
-      failed = true;
-      return outcome.then(() => {
-        throw failure;
-      });
-    });
-  }
+  mock.method(
+    PythonExecutor.prototype,
+    "callAsync",
+    async function (this: PythonExecutor, ...args: Parameters<typeof callAsync>) {
+      await Reflect.apply(callAsync, this, args);
+      throw failure;
+    },
+    { times: 1 },
+  );
   try {
     await assert.rejects(
       () => python.exec("executor_failure_was_run = True"),
       (error: unknown) => error === failure,
     );
-    Reflect.deleteProperty(PythonLibrary.prototype, "PyTuple_New");
-    mock.restoreAll();
-    assert.equal(python.main.executor_failure_was_run, scenario === "executor-completion-error", "only a completion failure may occur after accepted Python work has executed");
-    assert.equal(await python.eval("6 * 7"), 42, "a completion failure must reject its request without stranding later work");
+    assert.equal(python.main.executor_failure_was_run, true, "a completion failure occurs after accepted Python work has executed");
+    assert.equal(await python.eval("6 * 7"), 42, "an executor failure must not strand later work");
   } finally {
-    Reflect.deleteProperty(PythonLibrary.prototype, "PyTuple_New");
     mock.restoreAll();
     await python.finalize();
   }
