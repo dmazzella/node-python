@@ -1,0 +1,24 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts"],
+  "tsconfig": "tsconfig.build.json",
+  "out": "docs",
+  "name": "@node-ctypes/python",
+  "readme": "README.md",
+  "includeVersion": true,
+  "sort": ["source-order"],
+  "projectDocuments": ["guides/README.md", "examples/README.md"],
+  "navigationLinks": {
+    "GitHub": "https://github.com/dmazzella/node-python",
+    "npm": "https://www.npmjs.com/package/@node-ctypes/python"
+  },
+  "exclude": ["**/node_modules/**", "**/tests/**", "**/examples/**"],
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "validation": {
+    "notExported": false,
+    "invalidLink": true,
+    "notDocumented": false
+  },
+  "highlightLanguages": ["typescript", "javascript", "python", "bash", "powershell", "json"]
+}

@@ -1,41 +1,26 @@
 # node-python (`@node-ctypes/python`)
 
-Embed CPython in Node.js with a TypeScript API powered by
+[![npm version](https://img.shields.io/npm/v/@node-ctypes/python.svg)](https://www.npmjs.com/package/@node-ctypes/python)
+[![npm downloads](https://img.shields.io/npm/dm/@node-ctypes/python.svg)](https://www.npmjs.com/package/@node-ctypes/python)
+[![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14%20%7C%203.14t%20%7C%203.15-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![CI](https://github.com/dmazzella/node-python/actions/workflows/ci.yml/badge.svg)](https://github.com/dmazzella/node-python/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+**Typed embedded CPython for Node.js**, powered by
 [node-ctypes](https://www.npmjs.com/package/node-ctypes).
-This standalone ESM package ships compiled JavaScript and declarations.
-Python runs in-process, not in a subprocess or sandbox.
+Python runs in-process (not in a subprocess or sandbox) with zero custom native addon to compile.
 
-## Requirements and installation
+- **Node.js 24+**, ESM, TypeScript declarations.
+- **CPython 3.12+**, including **free-threaded builds (`3.13t` / `3.14t`, `Py_GIL_DISABLED`)** on Windows, Linux and macOS (x64 & ARM64).
+- **Non-blocking by default**: Python calls, `exec`, `eval` and `import` run on a dedicated native `Executor` thread, with bidirectional `asyncio`, async iterators, `AbortSignal` cancellation, shared memoryviews and native `JsProxy` objects.
 
-- Node.js 24+ and an ESM application.
-- Python 3.12+ with a shared library matching Node.js architecture and Python ABI.
-- Windows, Linux or macOS.
+---
 
-Windows and macOS installations normally include the shared library. On
-Debian/Ubuntu install the matching `libpython3.x` package; with pyenv use
-`PYTHON_CONFIGURE_OPTS=--enable-shared`.
-Install optional Python dependencies into the selected interpreter's environment.
-Neither Python nor its packages are bundled.
+## Quick start
 
 ```sh
 npm install @node-ctypes/python
 ```
-
-To build from source, run from this directory:
-
-```sh
-npm install
-npm run build
-npm test
-npm pack
-```
-
-Install the resulting tarball into your application with
-`npm install /path/to/node-ctypes-python-0.1.0.tgz`.
-The runtime dependency is published `node-ctypes` (`^2.10.0`); no custom native
-bridge, core patch or JavaScript worker is required.
-
-## Quick start
 
 ```typescript
 import { Python, kwargs } from "@node-ctypes/python";
@@ -58,173 +43,50 @@ try {
 }
 ```
 
-### Configuration
+To build from source, see [Getting started](guides/getting-started.md#building-from-source).
 
-`Python.initialize({ executable, library, stdin, stdout, stderr, synchronousCallbacks, switchInterval })`
-returns the runtime singleton. Options apply to the first initialization.
+## Supported platforms
 
-- `executable`, or `PYTHON`, selects the interpreter; an explicit choice never
-  falls back. Otherwise discovery tries installed Python commands.
-- `library`, or `PYTHON_LIBRARY`, overrides shared-library discovery. The selected
-  interpreter supplies `sys.path`, including virtualenv paths. Each discovery
-  probe has a 10-second timeout.
-- `stdin: false` leaves standard input to Node.js. `stdout` and `stderr` accept
-  `"inherit"` (default), `"node"`, `"console"` or a text callback. `"console"`
-  sends whole lines to `console.log` / `console.error` (a line without its newline
-  on `flush()` or at finalization). Without a console, as in an Electron renderer
-  or a packaged GUI app on Windows, Python's `sys.stdout` and `sys.stderr` are
-  `None` and `"inherit"` discards the output, as `pythonw` does: use `"console"`
-  (DevTools) or a callback (e.g. a log file).
-- `synchronousCallbacks: true` enables native callback dispatch during
-  interruptible synchronous Python waits. It requires an available SIGURG wakeup
-  on POSIX, or Windows Python 3.14+ with its interrupt event available.
-  Unsupported configurations fail explicitly; the default is `false`.
-- `switchInterval` sets the GIL switch interval in milliseconds
-  (`sys.setswitchinterval`). The default is `5`, as in CPython. Every Python call
-  acquires the GIL on the Node.js thread, so while Python threads run CPU-bound
-  code each call can stall the event loop for several intervals: on Windows we
-  measured stalls of 150–250 ms with the default. `0.5` reduced them to under
-  50 ms, but slowed two contending CPU-bound Python threads by 40% or more.
-  To keep the main thread free without that cost, host Python in a worker
-  (`examples/worker.ts`).
+| Operating system | x64 | ARM64 |
+| ---------------- | --- | ----- |
+| Windows          | ✅  | ✅    |
+| macOS            | ✅  | ✅    |
+| Linux            | ✅  | ✅    |
 
-Native objects are always enabled; there is no `nativeObjects` mode.
-Free-threaded builds require their matching executable and shared library;
-an ABI3t compatibility DLL alone does not enable free threading.
+Node.js 24 or later and shared CPython 3.12+ (including free-threaded builds). Verified in Electron and under `NODE_CTYPES_NO_EXTERNAL_BUFFERS=1` (mirror mode).
 
-## API and execution model
+---
 
-| API                                              | Purpose                                                |
-| ------------------------------------------------ | ------------------------------------------------------ |
-| `Python.initialize(options)`                     | Initialize the singleton asynchronously                |
-| `python.main`, `python.builtins`                 | Live module proxies                                    |
-| `python.version`, `.executable`, `.library`      | Selected interpreter information                       |
-| `await python.exec(code)`                        | Execute statements in `__main__`                       |
-| `await python.eval<T>(expression)`               | Evaluate and deeply convert the result                 |
-| `await python.import<T>(name)`                   | Import a live module, including dotted names           |
-| `python.module(name, members)`                   | Register JavaScript members as a Python module         |
-| `python.toPython<T>(value)`                      | Create an explicitly disposable Python proxy           |
-| `python.run(operation, { signal })`              | Await a Python operation or awaitable, with abort      |
-| `await python.with(manager, body)` / `asyncWith` | Run a context manager, including exception suppression |
-| `python.stats()`                                 | Inspect shared-reference and scheduler counters        |
-| `await python.finalize()`                        | Drain accepted native calls and close the runtime      |
+## Guides
 
-Exports also include `PythonError`, `Tuple`, `kwargs`, `byReference` and
-`cancellable`. Types and generics describe the dynamic API; they do not validate
-Python types at runtime.
+- [Getting started](guides/getting-started.md) — installation, requirements, interpreter discovery and `Python.initialize()` options
+- [Execution model](guides/execution-model.md) — the Python executor, synchronous live access, worker hosting, `stats()` and `finalize()`
+- [Values, memory and lifetime](guides/values-and-memory.md) — conversions, `Tuple`, `kwargs`, `Date` and `Temporal`, `byReference()`, shared buffers and disposal
+- [Callbacks, modules and JsProxy](guides/callbacks-and-modules.md) — JavaScript functions, classes, `python.module()`, `JsProxy` and cross-thread callbacks
+- [Async, cancellation and context managers](guides/async-and-cancellation.md) — `asyncio`, bidirectional async iterators, `python.run()`, `cancellable()`, `with()` and `asyncWith()`
+- [Errors and limits](guides/errors.md) — `PythonError`, exception propagation, `KeyboardInterrupt` and runtime limits
+- [Electron and free-threaded Python](guides/electron-and-free-threading.md) — Electron main/renderer integration, mirror mode and `Py_GIL_DISABLED` builds (`3.13t` / `3.14t`)
+- [Building, testing and internals](guides/contributing.md) — test suites, mirror-mode and stress tests, CI and release workflow
 
-**Calls are asynchronous; live access is synchronous.** Python functions, methods,
-classes and builtins return Promises, including `await new cls(...)`.
-Calls, imports, `exec` and `eval` execute in order on one native thread (a
-node-ctypes `Executor`) without occupying a waiting libuv worker. Arguments and
-results are converted on Node.js, so thousands of concurrent calls (e.g.
-`Promise.all` over an array) hold Node.js while they are submitted and while
-their results are converted: pass the data to one Python call instead, or host
-Python in a worker (`examples/worker.ts`). Attributes, indices, assignment, enumeration, ordinary iteration, conversion and
-disposal remain synchronous and can block Node.js. Native initialization and
-finalization also run synchronously on the hosting Node.js thread.
+Implementation diagrams and ownership invariants (in Italian): [FLOWS.md](FLOWS.md).
 
-Python coroutine results are automatically awaited through a separate asyncio
-thread. Async iterators work in both directions. An async JavaScript callback
-must be awaited from Python; a synchronous Python callback cannot return a
-JavaScript Promise. `cancellable(fn)` adds an `AbortSignal` to callbacks that
-cooperate with Python cancellation.
+---
 
-`python.run(operation, { signal })` accepts the Promise of a call, `exec`,
-`eval` or `import`, or a Python awaitable, and rejects with `signal.reason`
-on abort (`AbortSignal.timeout(ms)` for time limits). A queued operation is
-skipped; running Python code receives one `KeyboardInterrupt`, so `finally`
-blocks run and `except Exception` does not swallow it. On CPython 3.12 only,
-a one-line loop that starts a `try` block (`try:` followed by `while True: ...`)
-skips that `finally` when interrupted; put the loop body on its own line.
-Native calls are
-interrupted only when they return; asyncio work is cancelled. Synchronous proxy
-access and JavaScript work cannot be aborted.
+## Examples
 
-### Values, memory and lifetime
+Runnable TypeScript examples live in `examples/`; see the [index](examples/README.md).
 
-- Scalars convert naturally; Python integers outside JavaScript's safe range
-  become bigints. Arrays, `Tuple`, objects/Maps and Sets copy to Python containers.
-  Dates become UTC datetimes; Temporal conversions require runtime support.
-- Other Python objects remain live proxies. `eval()` and `proxy.toJS()` perform
-  deep conversion; ordinary call results use shallow conversion. Circular copies
-  are rejected; use live proxies or `byReference()` instead.
-- Arbitrary JavaScript instances remain shared references. `byReference(value)`
-  also shares ordinary containers. Python attributes take precedence over dict keys.
-- Buffer/Uint8Array values copy to Python bytes; other typed arrays, ArrayBuffers
-  and DataViews expose shared memoryviews. `byReference(buffer)` shares writable
-  memory. `proxy.toTypedArray()` requires a C-contiguous Python buffer and copies
-  read-only buffers. Do not detach, transfer or resize shared backing memory.
-- Release owned proxies with `[Symbol.dispose]()` when practical, including
-  `PythonError.exception`. GC is nondeterministic. Disposal drops the reference
-  immediately; on free-threaded builds CPython may run the object's destructor
-  later, when the thread that created it next runs Python code. `PythonError` exposes `type`,
-  `traceback`, `exception` and, when available, the original JavaScript `cause`.
+- [basics.ts](examples/basics.ts) — values, live proxies, errors, conversions and context managers
+- [callbacks.ts](examples/callbacks.ts) — JavaScript callbacks, constructors and `JsProxy`
+- [threads.ts](examples/threads.ts) — Python threads and cross-thread JavaScript callbacks
+- [async.ts](examples/async.ts) — `asyncio`, `python.run()` cancellation and async iterators
+- [module.ts](examples/module.ts) — JavaScript modules (`python.module`) and local Python imports
+- [worker.ts](examples/worker.ts) — hosting CPython inside a Node.js worker
+- [cryptography.ts](examples/cryptography.ts) — Python `cryptography` integration
+- [lxml.ts](examples/lxml.ts) — XML parsing, XPath, XSLT and canonicalization
 
-Only one JavaScript thread per process may host Python. A Node.js worker can
-isolate synchronous access and conversions, but must finalize before terminating.
-Wait for application work and Python threads before finalization; do not finalize
-inside a Python callback. Repeated finalization is harmless; restart and
-subinterpreters are not supported. Never use Python proxies or Python-backed
-memory afterward.
+---
 
-Closing rejects new calls and drains accepted native operations, not every
-pending coroutine: remaining awaits are rejected during teardown. Cleanup also
-runs on normal `beforeExit`; `process.exit()` is not orderly finalization.
-Shutdown can wait for Python threads and has no overall timeout.
-Execute trusted Python code only.
+## License
 
-## Examples and tests
-
-Run examples directly, for example `node examples/basics.ts`.
-They cover usage in more detail than this overview:
-
-| Example                                       | Focus                                         |
-| --------------------------------------------- | --------------------------------------------- |
-| [basics.ts](./examples/basics.ts)             | Values, live objects, errors and conversions  |
-| [callbacks.ts](./examples/callbacks.ts)       | JavaScript callbacks and constructors         |
-| [threads.ts](./examples/threads.ts)           | Python threads and cross-thread callbacks     |
-| [async.ts](./examples/async.ts)               | Await, cancellation and async iteration       |
-| [module.ts](./examples/module.ts)             | JavaScript modules and local Python imports   |
-| [worker.ts](./examples/worker.ts)             | Hosting Python in a Node.js worker            |
-| [cryptography.ts](./examples/cryptography.ts) | Python cryptography integration               |
-| [lxml.ts](./examples/lxml.ts)                 | XML parsing, XPath, XSLT and canonicalization |
-
-Optional packages are needed only for the corresponding examples and must be
-installed in the selected interpreter. Set `PYTHON` to that executable if it
-differs from the one found automatically. The suite regression-tests callbacks
-and missing-package diagnostics; other example scenarios are manual.
-
-```sh
-npm run typecheck
-npm test
-npm run test:unit
-npm run test:integration
-npm run test:types
-npm run test:backlog
-npm run test:stress
-```
-
-`npm test` builds and runs the ordinary suite; integration tests require shared
-CPython. Typechecks include sources, examples and test helpers.
-`test:backlog` checks queued ownership, every outcome and shutdown under load.
-`test:stress` adds a 60-second mixed workload; set `NODE_PYTHON_STRESS_SECONDS`
-to change its duration. Both are opt-in, force GC in isolated children and report
-memory/latency diagnostics, not performance or leak-certification guarantees.
-The runtime does not impose application backpressure.
-
-Two manual checks run in Electron's main process after `npm run build`
-(`electron <file>`, with `ELECTRON_RUN_AS_NODE` unset):
-[tests/electron/main.mjs](./tests/electron/main.mjs) prints a JSON report of
-calls, a free UI thread during a long call and bursts of calls;
-[tests/electron/ui/main.mjs](./tests/electron/ui/main.mjs) opens a window that
-charts frame times and main-process IPC latency while bursts run in the main
-process or in the renderer (`--auto` runs both, prints the table and quits).
-
-The [CI workflow](./.github/workflows/ci.yml) runs `npm test` with Python
-3.12, 3.13, 3.14, 3.14t and 3.15 on Windows, Linux and macOS. It is discovered only when
-this package is a repository root, not while nested in another repository.
-Pushing a `v<version>` tag that matches `package.json` publishes to npm once the
-whole matrix passes (npm Trusted Publishing; versions with a `-` go to `next`).
-For implementation diagrams and ownership invariants, see [FLOWS.md](./FLOWS.md)
-(Italian).
+[MIT](LICENSE).
