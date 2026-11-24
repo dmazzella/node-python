@@ -45,19 +45,23 @@
     "typecheck": "tsc -p tsconfig.json && npm run test:types",
     "build": "npm run clean && tsc -p tsconfig.build.json",
     "test": "npm run build && npm run test:types && node --test --test-timeout=60000 --test-concurrency=1 \"tests/src/*.test.ts\"",
+    "test:mirror": "npm run build && node -e \"const { spawnSync } = require('node:child_process'); const r = spawnSync(process.execPath, ['--test', '--test-timeout=60000', '--test-concurrency=1', 'tests/src/*.test.ts'], { stdio: 'inherit', env: { ...process.env, NODE_CTYPES_NO_EXTERNAL_BUFFERS: '1' } }); process.exit(r.status ?? 1);\"",
     "test:unit": "npm run build && node --test --test-timeout=60000 \"tests/src/unit.*.test.ts\"",
     "test:integration": "npm run build && node --test --test-timeout=60000 --test-concurrency=1 \"tests/src/integration.*.test.ts\"",
     "test:stress": "npm run build && npm run test:types && node --test --test-concurrency=1 \"tests/stress/*.test.ts\"",
     "test:backlog": "npm run build && npm run test:types && node --test --test-concurrency=1 tests/stress/backlog.test.ts",
     "test:types": "tsc -p tests/tsconfig.json && tsc -p tests/types/tsconfig.json",
+    "docs": "typedoc",
+    "docs:serve": "typedoc && npx serve docs",
     "prepack": "npm run build",
     "prepublishOnly": "npm test"
   },
   "dependencies": {
-    "node-ctypes": "^2.15.2"
+    "node-ctypes": "^2.15.5"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "typedoc": "^0.28.20",
     "typescript": "~6.0.3"
   }
 }

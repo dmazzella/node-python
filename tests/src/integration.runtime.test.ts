@@ -276,6 +276,14 @@ cycle_indirect.append(cycle_tuple)
     view[0] = 99;
     assert.equal(view[0], 99);
     assert.equal(array[0], EXTERNAL_BUFFERS ? 99 : 1);
+    if (!EXTERNAL_BUFFERS) {
+      // Mirror mode copies the bytes and releases the Python buffer export lock immediately.
+      using mutable = await python.builtins.bytearray(Buffer.from([1, 2, 3]));
+      const copied = mutable.toTypedArray();
+      assert.deepEqual([...copied], [1, 2, 3]);
+      await mutable.append(4);
+      assert.equal(mutable.length, 4);
+    }
     assert.deepEqual(python.toPython(Buffer.from([1, 2])).toJS(), Buffer.from([1, 2]));
   });
 

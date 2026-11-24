@@ -37,6 +37,8 @@ export class PythonPlatform {
       } catch (error) {
         if (!(error instanceof PythonError) || !["AttributeError", "OSError", "UnsupportedOperation"].includes(error.type)) throw error;
         error.exception[Symbol.dispose]();
+      } finally {
+        stream[Symbol.dispose]();
       }
     }
   }

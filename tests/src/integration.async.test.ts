@@ -231,4 +231,32 @@ async def await_unconvertible():
     assert.equal(python.stats().calls, 0);
     assert.equal(python.stats().awaits, 0);
   });
+
+  it("exposes Python objects returned by coroutines as public async proxies without leaking futures", async () => {
+    await python.exec(`
+class AsyncBox:
+    def get(self):
+        return 42
+
+async def make_async_box():
+    return AsyncBox()
+`);
+    // Warm up the asyncio event loop once, then verify zero proxy leaks across coroutine calls.
+    {
+      using warmFn = python.main.make_async_box;
+      using warmBox = await warmFn();
+      using warmGet = warmBox.get;
+      assert.equal(await warmGet(), 42);
+    }
+    const before = python.stats().proxies;
+    {
+      using makeBox = python.main.make_async_box;
+      using box = await makeBox();
+      using get = box.get;
+      const pending = get();
+      assert.ok(pending instanceof Promise);
+      assert.equal(await pending, 42);
+    }
+    assert.equal(python.stats().proxies, before);
+  });
 });

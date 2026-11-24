@@ -149,9 +149,25 @@ def unregister_native_dispatcher(token):
 export class PythonScheduler {
   #builtins: PythonObject;
   #module: PythonObject;
-  #inspect: PythonObject;
-  #operator: PythonObject;
-  #functools: PythonObject;
+  #isawaitable: PythonObject;
+  #isinstance: PythonObject;
+  #hasattr: PythonObject;
+  #getattr: PythonObject;
+  #typeFn: PythonObject;
+  #aiter: PythonObject;
+  #len: PythonObject;
+  #getitem: PythonObject;
+  #eq: PythonObject;
+  #partial: PythonObject;
+  #futureType: PythonObject;
+  #runCoroutineThreadsafe: PythonObject;
+  #awaitHelper: PythonObject;
+  #completedHelper: PythonObject;
+  #anextHelper: PythonObject;
+  #requests: PythonObject;
+  #calls: PythonObject;
+  #lockAcquire: PythonObject;
+  #lockRelease: PythonObject;
   #sys: PythonObject;
   #publicRequest: PythonObject;
   #heldRequest: PythonObject;
@@ -160,9 +176,19 @@ export class PythonScheduler {
   constructor(builtins: PythonObject, importModule: (name: string) => PythonObject, module: PythonObject, busyAddress: bigint, raiseException: (exception: PythonObject) => never, wakeup = false) {
     this.#builtins = builtins;
     this.#module = module;
-    this.#inspect = importModule("inspect");
-    this.#operator = importModule("operator");
-    this.#functools = importModule("functools");
+    using inspect = importModule("inspect");
+    this.#isawaitable = inspect.isawaitable;
+    this.#isinstance = builtins.isinstance;
+    this.#hasattr = builtins.hasattr;
+    this.#getattr = builtins.getattr;
+    this.#typeFn = builtins.type;
+    this.#aiter = builtins.aiter;
+    this.#len = builtins.len;
+    using operator = importModule("operator");
+    this.#getitem = operator.getitem;
+    this.#eq = operator.eq;
+    using functools = importModule("functools");
+    this.#partial = functools.partial;
     this.#sys = importModule("sys");
     this.#raiseException = raiseException;
     this.#publicRequest = builtins.slice(null, 3);
@@ -175,43 +201,82 @@ export class PythonScheduler {
       time: "time",
       traceback: "traceback",
       warnings: "warnings",
-    }))
-      module[name] = importModule(library);
-    module._lock = module.threading.Lock();
-    module._events = importModule("queue").SimpleQueue();
-    module._queued = builtins.list();
-    module._requests = builtins.dict();
-    module._calls = builtins.dict();
-    module._tokens = importModule("itertools").count(1);
+    })) {
+      using imported = importModule(library);
+      module[name] = imported;
+    }
+    using threadingMod = module.threading;
+    using lock = threadingMod.Lock();
+    module._lock = lock;
+    this.#lockAcquire = lock.acquire;
+    this.#lockRelease = lock.release;
+    using queueMod = importModule("queue");
+    using events = queueMod.SimpleQueue();
+    module._events = events;
+    using queued = builtins.list();
+    module._queued = queued;
+    this.#requests = builtins.dict();
+    module._requests = this.#requests;
+    this.#calls = builtins.dict();
+    module._calls = this.#calls;
+    using itertools = importModule("itertools");
+    using tokens = itertools.count(1);
+    module._tokens = tokens;
     module._closing = false;
     module._loop = null;
     module._loop_error = null;
     module._notify = null;
     module._wakeup = null;
     module._interrupt_event = null;
-    module._native_dispatchers = builtins.dict();
+    using nativeDispatchers = builtins.dict();
+    module._native_dispatchers = nativeDispatchers;
     module._drains = 0;
-    module._main_busy = module.ctypes.c_int.from_address(busyAddress);
-    module._NOTIFY = module.ctypes.CFUNCTYPE(null, module.ctypes.c_int, module.ctypes.c_int);
-    module._NATIVE_NOTIFY = module.ctypes.CFUNCTYPE(null);
-    module._PENDING = module.ctypes.CFUNCTYPE(module.ctypes.c_int, module.ctypes.c_void_p);
-    module._add_pending_call = module.ctypes.pythonapi.Py_AddPendingCall;
-    module._add_pending_call.argtypes = Tuple.of(module._PENDING, module.ctypes.c_void_p);
+    using ctypesMod = module.ctypes;
+    using c_int = ctypesMod.c_int;
+    using c_void_p = ctypesMod.c_void_p;
+    using mainBusy = c_int.from_address(busyAddress);
+    module._main_busy = mainBusy;
+    using notifyType = ctypesMod.CFUNCTYPE(null, c_int, c_int);
+    module._NOTIFY = notifyType;
+    using nativeNotifyType = ctypesMod.CFUNCTYPE(null);
+    module._NATIVE_NOTIFY = nativeNotifyType;
+    using pendingType = ctypesMod.CFUNCTYPE(c_int, c_void_p);
+    module._PENDING = pendingType;
+    using pythonapi = ctypesMod.pythonapi;
+    using addPending = pythonapi.Py_AddPendingCall;
+    addPending.argtypes = Tuple.of(pendingType, c_void_p);
+    module._add_pending_call = addPending;
     definePython(builtins, module, THREAD_ADAPTERS, "<node-python thread adapters>");
-    module._serve_pending_c = module._PENDING(module._serve_pending);
+    using servePending = module._serve_pending;
+    using servePendingC = pendingType(servePending);
+    module._serve_pending_c = servePendingC;
+    using futuresMod = module.concurrent_futures;
+    this.#futureType = futuresMod.Future;
+    using asyncioMod = module.asyncio;
+    this.#runCoroutineThreadsafe = asyncioMod.run_coroutine_threadsafe;
+    this.#awaitHelper = module._await;
+    this.#completedHelper = module._completed;
+    this.#anextHelper = module._anext;
     if (wakeup) this.#installWakeup();
   }
 
   #installWakeup(): void {
     const m = this.#module;
     if (this.#sys.platform === "win32") {
-      if (this.#sys.version_info[0] > 3 || this.#sys.version_info[1] >= 14) {
+      using versionInfo = this.#sys.version_info;
+      if (versionInfo[0] > 3 || versionInfo[1] >= 14) {
         try {
-          const event = m.ctypes.pythonapi._PyOS_SigintEvent;
-          event.restype = m.ctypes.c_void_p;
+          using ctypesMod = m.ctypes;
+          using pythonapi = ctypesMod.pythonapi;
+          using event = pythonapi._PyOS_SigintEvent;
+          using cVoidP = ctypesMod.c_void_p;
+          event.restype = cVoidP;
           m._interrupt_event = event();
-          m._kernel32 = m.ctypes.WinDLL("kernel32");
-          m._kernel32.SetEvent.argtypes = m._kernel32.ResetEvent.argtypes = Tuple.of(m.ctypes.c_void_p);
+          using kernel32 = ctypesMod.WinDLL("kernel32");
+          using setEvent = kernel32.SetEvent;
+          using resetEvent = kernel32.ResetEvent;
+          setEvent.argtypes = resetEvent.argtypes = Tuple.of(cVoidP);
+          m._kernel32 = kernel32;
         } catch (error) {
           if (!(error instanceof PythonError) || !["AttributeError", "OSError"].includes(error.type)) throw error;
           error.exception[Symbol.dispose]();
@@ -220,144 +285,144 @@ export class PythonScheduler {
       }
       return;
     }
-    if (!this.#builtins.hasattr(m.signal, "pthread_kill") || !this.#builtins.hasattr(m.signal, "SIGURG")) return;
-    const current = m.signal.getsignal(m.signal.SIGURG);
-    if (current !== null && !this.#operator.eq(current, m.signal.SIG_DFL) && !this.#operator.eq(current, m.signal.SIG_IGN)) return;
-    m.signal.signal(m.signal.SIGURG, m._serve_waiting);
-    m._wakeup = m.signal.SIGURG;
+    using sig = m.signal;
+    if (!this.#hasattr(sig, "pthread_kill") || !this.#hasattr(sig, "SIGURG")) return;
+    using current = sig.getsignal(sig.SIGURG);
+    using sigDfl = sig.SIG_DFL;
+    using sigIgn = sig.SIG_IGN;
+    if (current !== null && !this.#eq(current, sigDfl) && !this.#eq(current, sigIgn)) return;
+    using serveWaiting = m._serve_waiting;
+    sig.signal(sig.SIGURG, serveWaiting);
+    m._wakeup = sig.SIGURG;
   }
 
   isAwaitable(object: PythonObject): boolean {
-    return this.#inspect.isawaitable(object) || this.#builtins.isinstance(object, this.#module.concurrent_futures.Future);
+    return this.#isawaitable(object) || this.#isinstance(object, this.#futureType);
   }
 
   isAsyncIterable(object: PythonObject): boolean {
-    return this.#builtins.hasattr(this.#builtins.type(object), "__aiter__");
+    using type = this.#typeFn(object);
+    return this.#hasattr(type, "__aiter__");
   }
 
   asyncIterator(object: PythonObject): PythonObject {
-    return this.#builtins.aiter(object);
+    return this.#aiter(object);
   }
 
   next(iterator: PythonObject): PythonObject {
-    return this.#module._anext(iterator);
+    return this.#anextHelper(iterator);
   }
 
   closeIterator(iterator: PythonObject): unknown {
-    const close = this.#builtins.getattr(iterator, "aclose", null);
+    using close = this.#getattr(iterator, "aclose", null);
     return close === null ? null : close();
   }
 
   #startLoop(): void {
     const m = this.#module;
-    m._lock.acquire();
+    this.#lockAcquire();
     try {
-      if (m._loop !== null) return;
-      m._loop = m.asyncio.new_event_loop();
+      using existing = m._loop;
+      if (existing !== null) return;
+      using asyncioMod = m.asyncio;
+      using loop = asyncioMod.new_event_loop();
+      m._loop = loop;
       m._loop_error = null;
     } finally {
-      m._lock.release();
+      this.#lockRelease();
     }
-    const ready = m.threading.Event();
-    const thread = m.threading.Thread(kwargs({ target: m._run_loop, args: Tuple.of(ready), name: "asyncio", daemon: true }));
-    try {
-      thread.start();
-      ready.wait();
-      if (m._loop_error !== null) {
-        const error: PythonObject = m._loop_error;
-        m._loop_error = null;
-        m._loop.close();
-        m._loop = null;
-        this.#raiseException(error);
-      }
-    } finally {
-      ready[Symbol.dispose]();
-      thread[Symbol.dispose]();
+    using threadingMod = m.threading;
+    using ready = threadingMod.Event();
+    using runLoop = m._run_loop;
+    using thread = threadingMod.Thread(kwargs({ target: runLoop, args: Tuple.of(ready), name: "asyncio", daemon: true }));
+    thread.start();
+    ready.wait();
+    if (m._loop_error !== null) {
+      const error: PythonObject = m._loop_error;
+      m._loop_error = null;
+      using loop = m._loop;
+      loop.close();
+      m._loop = null;
+      this.#raiseException(error);
     }
   }
 
   submit(awaitable: PythonObject, token: number): PythonObject {
     const m = this.#module;
     let future: PythonObject;
-    if (this.#builtins.isinstance(awaitable, m.concurrent_futures.Future)) future = awaitable;
+    if (this.#isinstance(awaitable, this.#futureType)) future = awaitable;
     else {
       this.#startLoop();
-      const coroutine = m._await(awaitable);
-      try {
-        future = m.asyncio.run_coroutine_threadsafe(coroutine, m._loop);
-      } finally {
-        coroutine[Symbol.dispose]();
-      }
+      using coroutine = this.#awaitHelper(awaitable);
+      using loop = m._loop;
+      future = this.#runCoroutineThreadsafe(coroutine, loop);
     }
-    const complete = this.#functools.partial(m._completed, token);
-    try {
-      future.add_done_callback(complete);
-      return future;
-    } finally {
-      complete[Symbol.dispose]();
-    }
+    using complete = this.#partial(this.#completedHelper, token);
+    using addDone = future.add_done_callback;
+    addDone(complete);
+    return future;
   }
 
   openChannel(address: bigint): void {
     const m = this.#module;
-    const thread = m.threading.Thread(kwargs({ target: m._notifier, name: "node-ctypes-notifier", daemon: true }));
+    using threadingMod = m.threading;
+    using notifier = m._notifier;
+    using thread = threadingMod.Thread(kwargs({ target: notifier, name: "node-ctypes-notifier", daemon: true }));
+    thread.start();
+    this.#lockAcquire();
     try {
-      thread.start();
+      using notifyType = m._NOTIFY;
+      using notify = notifyType(address);
+      m._notify = notify;
+      using queued = m._queued;
+      using events = m._events;
+      for (const event of queued) {
+        try {
+          events.put(Tuple.of(notify, ...event));
+        } finally {
+          if (event !== null && (typeof event === "object" || typeof event === "function") && Symbol.dispose in event) (event as Disposable)[Symbol.dispose]();
+        }
+      }
+      queued.clear();
     } finally {
-      thread[Symbol.dispose]();
-    }
-    m._lock.acquire();
-    try {
-      m._notify = m._NOTIFY(address);
-      for (const event of m._queued) m._events.put(Tuple.of(m._notify, ...event));
-      m._queued.clear();
-    } finally {
-      m._lock.release();
+      this.#lockRelease();
     }
   }
 
   takeRequest(token: number): PythonObject | null {
-    const m = this.#module;
-    const request = m._requests.pop(token, null);
+    using pop = this.#requests.pop;
+    const request = pop(token, null);
     if (request === null) return null;
     try {
-      const future: PythonObject = request[3];
-      try {
-        if (future.cancelled()) return null;
-      } finally {
-        future[Symbol.dispose]();
-      }
-      const held = this.#operator.getitem(request, this.#heldRequest);
-      try {
-        m._calls[token] = held;
-      } finally {
-        held[Symbol.dispose]();
-      }
-      return this.#operator.getitem(request, this.#publicRequest);
+      using future = request[3];
+      using cancelled = future.cancelled;
+      if (cancelled()) return null;
+      using held = this.#getitem(request, this.#heldRequest);
+      this.#calls[token] = held;
+      return this.#getitem(request, this.#publicRequest);
     } finally {
       request[Symbol.dispose]();
     }
   }
 
   settle(token: number, ok: boolean, value: PythonObject): void {
-    const call = this.#module._calls.pop(token, null);
+    using pop = this.#calls.pop;
+    using call = pop(token, null);
     if (call === null) return;
-    try {
-      const future = call[0];
-      try {
-        if (!future.set_running_or_notify_cancel()) return;
-        if (ok) future.set_result(value);
-        else future.set_exception(value);
-      } finally {
-        future[Symbol.dispose]();
-      }
-    } finally {
-      call[Symbol.dispose]();
+    using future = call[0];
+    using setRunning = future.set_running_or_notify_cancel;
+    if (!setRunning()) return;
+    if (ok) {
+      using setResult = future.set_result;
+      setResult(value);
+    } else {
+      using setException = future.set_exception;
+      setException(value);
     }
   }
 
   get calls(): number {
-    return this.#builtins.len(this.#module._calls) + this.#builtins.len(this.#module._requests);
+    return this.#len(this.#calls) + this.#len(this.#requests);
   }
 
   shutdown(): PythonObject | null {

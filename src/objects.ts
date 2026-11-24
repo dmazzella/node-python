@@ -42,46 +42,17 @@ export interface NativeSlot {
   drain(): number;
 }
 
-function isNativeSlot(value: unknown): value is NativeSlot {
-  if (typeof value !== "object" || value === null) return false;
-  return (
-    "pointer" in value &&
-    typeof value.pointer === "bigint" &&
-    "release" in value &&
-    typeof value.release === "function" &&
-    "unref" in value &&
-    typeof value.unref === "function" &&
-    "setNativeError" in value &&
-    typeof value.setNativeError === "function" &&
-    "drain" in value &&
-    typeof value.drain === "function" &&
-    "_callback" in value &&
-    typeof value._callback === "object" &&
-    value._callback !== null &&
-    "setNativeError" in value._callback &&
-    typeof value._callback.setNativeError === "function" &&
-    "drain" in value._callback &&
-    typeof value._callback.drain === "function"
-  );
-}
-
-export function nativeSlot(api: PythonLibrary, handler: (...args: unknown[]) => unknown, restype: typeof c_void_p | typeof c_ssize_t | typeof c_int | null, argtypes: (typeof c_void_p | typeof c_int)[], notify?: bigint): NativeSlot {
-  // Reflect keeps the standalone project type-compatible with the published core.
-  const created: unknown = Reflect.apply(threadSafeCallback, undefined, [
-    handler,
-    restype,
-    argtypes,
-    {
-      nativeContext: {
-        suspend: api.PyEval_SaveThread,
-        resume: api.PyEval_RestoreThread,
-        onError: api.PyErr_SetRaisedException,
-        ...(notify === undefined ? {} : { notify }),
-      },
+export function nativeSlot(api: PythonLibrary, handler: (...args: unknown[]) => Result | void, restype: typeof c_void_p | typeof c_ssize_t | typeof c_int | null, argtypes: (typeof c_void_p | typeof c_int)[], notify?: bigint): NativeSlot {
+  const created = threadSafeCallback(handler, restype, argtypes, {
+    nativeContext: {
+      suspend: api.PyEval_SaveThread,
+      resume: api.PyEval_RestoreThread,
+      onError: api.PyErr_SetRaisedException,
+      ...(notify === undefined ? {} : { notify }),
     },
-  ]);
-  if (!isNativeSlot(created)) {
-    if (typeof created === "object" && created !== null && "release" in created && typeof created.release === "function") created.release();
+  }) as unknown as NativeSlot;
+  if (typeof created?.setNativeError !== "function" || typeof created?.drain !== "function") {
+    created?.release?.();
     throw new Error("node-python requires node-ctypes 2.6.0+ with native callback contexts and drain()");
   }
   created.unref();

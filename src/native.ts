@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Damiano Mazzella. MIT License (see LICENSE).
-import { CDLL, RTLD_GLOBAL, Structure, CFUNCTYPE, c_char_p, c_void_p, c_int, c_uint, c_long, c_ulong, c_int64, c_double, c_ssize_t } from "node-ctypes";
+import { CDLL, RTLD_GLOBAL, Structure, CFUNCTYPE, c_char_p, c_void_p, c_int, c_uint, c_long, c_int64, c_double, c_ssize_t } from "node-ctypes";
 import type { FFIType, FunctionWrapper, TypedFFIFunction } from "node-ctypes";
 import type { InterpreterInfo } from "./types.ts";
 export const MIN_PYTHON = [3, 12];
@@ -66,7 +66,6 @@ export const API = {
   PyObject_GetAttrString: [c_void_p, [c_void_p, c_char_p]],
   PyObject_GenericGetAttr: [c_void_p, [c_void_p, c_void_p]],
   PyObject_GenericSetAttr: [c_int, [c_void_p, c_void_p, c_void_p]],
-  PyObject_GetTypeData: [c_void_p, [c_void_p, c_void_p]],
   PyObject_SetAttrString: [c_int, [c_void_p, c_char_p, c_void_p]],
   PyObject_HasAttrString: [c_int, [c_void_p, c_char_p]],
   PyObject_GetItem: [c_void_p, [c_void_p, c_void_p]],
@@ -86,13 +85,10 @@ export const API = {
   PyErr_SetRaisedException: [null, [c_void_p]],
   PyErr_SetString: [null, [c_void_p, c_char_p]],
   PyType_GetName: [c_void_p, [c_void_p]],
-  PyType_FromSpec: [c_void_p, [c_void_p]],
   PyType_FromSpecWithBases: [c_void_p, [c_void_p, c_void_p]],
   PyType_GenericAlloc: [c_void_p, [c_void_p, c_ssize_t]],
-  PyType_GetSlot: [c_void_p, [c_void_p, c_int]],
   PyErr_Clear: [null, []],
   PyErr_ExceptionMatches: [c_int, [c_void_p]],
-  PyThreadState_SetAsyncExc: [c_int, [c_ulong, c_void_p]],
   Py_IncRef: [null, [c_void_p]],
   Py_DecRef: [null, [c_void_p]],
   PyBool_FromLong: [c_void_p, [c_long]],
@@ -101,6 +97,7 @@ export const API = {
   PyLong_FromString: [c_void_p, [c_char_p, c_void_p, c_int]],
   PyLong_AsLongLong: [c_int64, [c_void_p]],
   PyLong_AsLongLongAndOverflow: [c_int64, [c_void_p, c_void_p]],
+  PyLong_AsVoidPtr: [c_void_p, [c_void_p]],
   PyNumber_AsSsize_t: [c_ssize_t, [c_void_p, c_void_p]],
   PyFloat_FromDouble: [c_void_p, [c_double]],
   PyFloat_AsDouble: [c_double, [c_void_p]],
@@ -151,7 +148,6 @@ export class PythonLibrary extends CDLL implements NativeAPI {
   declare PyObject_GetAttrString: NativeAPI["PyObject_GetAttrString"];
   declare PyObject_GenericGetAttr: NativeAPI["PyObject_GenericGetAttr"];
   declare PyObject_GenericSetAttr: NativeAPI["PyObject_GenericSetAttr"];
-  declare PyObject_GetTypeData: NativeAPI["PyObject_GetTypeData"];
   declare PyObject_SetAttrString: NativeAPI["PyObject_SetAttrString"];
   declare PyObject_HasAttrString: NativeAPI["PyObject_HasAttrString"];
   declare PyObject_GetItem: NativeAPI["PyObject_GetItem"];
@@ -171,13 +167,10 @@ export class PythonLibrary extends CDLL implements NativeAPI {
   declare PyErr_SetRaisedException: NativeAPI["PyErr_SetRaisedException"];
   declare PyErr_SetString: NativeAPI["PyErr_SetString"];
   declare PyType_GetName: NativeAPI["PyType_GetName"];
-  declare PyType_FromSpec: NativeAPI["PyType_FromSpec"];
   declare PyType_FromSpecWithBases: NativeAPI["PyType_FromSpecWithBases"];
   declare PyType_GenericAlloc: NativeAPI["PyType_GenericAlloc"];
-  declare PyType_GetSlot: NativeAPI["PyType_GetSlot"];
   declare PyErr_Clear: NativeAPI["PyErr_Clear"];
   declare PyErr_ExceptionMatches: NativeAPI["PyErr_ExceptionMatches"];
-  declare PyThreadState_SetAsyncExc: NativeAPI["PyThreadState_SetAsyncExc"];
   declare Py_IncRef: NativeAPI["Py_IncRef"];
   declare Py_DecRef: NativeAPI["Py_DecRef"];
   declare PyBool_FromLong: NativeAPI["PyBool_FromLong"];
@@ -186,6 +179,7 @@ export class PythonLibrary extends CDLL implements NativeAPI {
   declare PyLong_FromString: NativeAPI["PyLong_FromString"];
   declare PyLong_AsLongLong: NativeAPI["PyLong_AsLongLong"];
   declare PyLong_AsLongLongAndOverflow: NativeAPI["PyLong_AsLongLongAndOverflow"];
+  declare PyLong_AsVoidPtr: NativeAPI["PyLong_AsVoidPtr"];
   declare PyNumber_AsSsize_t: NativeAPI["PyNumber_AsSsize_t"];
   declare PyFloat_FromDouble: NativeAPI["PyFloat_FromDouble"];
   declare PyFloat_AsDouble: NativeAPI["PyFloat_AsDouble"];

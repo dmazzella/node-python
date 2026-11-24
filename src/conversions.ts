@@ -4,67 +4,122 @@ import type { InternalPythonObject as PythonObject } from "./types.ts";
 
 /** Standard-library operations invoked through the runtime's C API proxies. */
 export class PythonConversions {
-  #builtins: PythonObject;
+  #isinstance: PythonObject;
+  #hasattr: PythonObject;
+  #getattr: PythonObject;
+  #setattr: PythonObject;
+  #delattr: PythonObject;
+  #len: PythonObject;
+  #iter: PythonObject;
+  #str: PythonObject;
+  #int: PythonObject;
+  #float: PythonObject;
+  #typeFn: PythonObject;
   #mapping: PythonObject;
   #mutableMapping: PythonObject;
-  #numbers: PythonObject;
-  #datetime: PythonObject;
-  #zoneinfo: PythonObject;
-  #operator: PythonObject;
-  #traceback: PythonObject;
+  #numberType: PythonObject;
+  #integralType: PythonObject;
+  #dtDatetime: PythonObject;
+  #dtDate: PythonObject;
+  #dtTime: PythonObject;
+  #dtTimedelta: PythonObject;
+  #dtTimezone: PythonObject;
+  #zoneInfo: PythonObject;
+  #contains: PythonObject;
+  #getitem: PythonObject;
+  #setitem: PythonObject;
+  #delitem: PythonObject;
+  #add: PythonObject;
+  #sub: PythonObject;
+  #mul: PythonObject;
+  #floordiv: PythonObject;
+  #truediv: PythonObject;
+  #formatException: PythonObject;
   #epoch: PythonObject;
   #microsecond: PythonObject;
 
   constructor(builtins: PythonObject, importModule: (name: string) => PythonObject) {
-    this.#builtins = builtins;
-    const abc = importModule("collections.abc");
+    this.#isinstance = builtins.isinstance;
+    this.#hasattr = builtins.hasattr;
+    this.#getattr = builtins.getattr;
+    this.#setattr = builtins.setattr;
+    this.#delattr = builtins.delattr;
+    this.#len = builtins.len;
+    this.#iter = builtins.iter;
+    this.#str = builtins.str;
+    this.#int = builtins.int;
+    this.#float = builtins.float;
+    this.#typeFn = builtins.type;
+    using abc = importModule("collections.abc");
     this.#mapping = abc.Mapping;
     this.#mutableMapping = abc.MutableMapping;
-    this.#numbers = importModule("numbers");
-    this.#datetime = importModule("datetime");
-    this.#zoneinfo = importModule("zoneinfo");
-    this.#operator = importModule("operator");
-    this.#traceback = importModule("traceback");
-    this.#epoch = this.#datetime.datetime(1970, 1, 1, kwargs({ tzinfo: this.#datetime.timezone.utc }));
-    this.#microsecond = this.#datetime.timedelta(kwargs({ microseconds: 1 }));
+    using numbers = importModule("numbers");
+    this.#numberType = numbers.Number;
+    this.#integralType = numbers.Integral;
+    using datetime = importModule("datetime");
+    this.#dtDatetime = datetime.datetime;
+    this.#dtDate = datetime.date;
+    this.#dtTime = datetime.time;
+    this.#dtTimedelta = datetime.timedelta;
+    this.#dtTimezone = datetime.timezone;
+    using zoneinfo = importModule("zoneinfo");
+    this.#zoneInfo = zoneinfo.ZoneInfo;
+    using operator = importModule("operator");
+    this.#contains = operator.contains;
+    this.#getitem = operator.getitem;
+    this.#setitem = operator.setitem;
+    this.#delitem = operator.delitem;
+    this.#add = operator.add;
+    this.#sub = operator.sub;
+    this.#mul = operator.mul;
+    this.#floordiv = operator.floordiv;
+    this.#truediv = operator.truediv;
+    using traceback = importModule("traceback");
+    this.#formatException = traceback.format_exception;
+    using utc = this.#dtTimezone.utc;
+    this.#epoch = this.#dtDatetime(1970, 1, 1, kwargs({ tzinfo: utc }));
+    this.#microsecond = this.#dtTimedelta(kwargs({ microseconds: 1 }));
   }
 
   getFallback(object: PythonObject, name: string): unknown {
-    if (this.#builtins.isinstance(object, this.#mapping) && (this.#operator.contains(object, name) || name !== "length")) return this.#operator.getitem(object, name);
-    if (name === "length" && this.#builtins.hasattr(this.#builtins.type(object), "__len__")) return this.#builtins.len(object);
-    return this.#builtins.getattr(object, name);
+    if (this.#isinstance(object, this.#mapping) && (this.#contains(object, name) || name !== "length")) return this.#getitem(object, name);
+    if (name === "length") {
+      using type = this.#typeFn(object);
+      if (this.#hasattr(type, "__len__")) return this.#len(object);
+    }
+    return this.#getattr(object, name);
   }
 
   setFallback(object: PythonObject, name: string, value: unknown): void {
-    if (this.#builtins.isinstance(object, this.#mutableMapping)) this.#operator.setitem(object, name, value);
-    else this.#builtins.setattr(object, name, value);
+    if (this.#isinstance(object, this.#mutableMapping)) this.#setitem(object, name, value);
+    else this.#setattr(object, name, value);
   }
 
   deleteFallback(object: PythonObject, name: string): void {
-    if (this.#builtins.isinstance(object, this.#mutableMapping)) this.#operator.delitem(object, name);
-    else this.#builtins.delattr(object, name);
+    if (this.#isinstance(object, this.#mutableMapping)) this.#delitem(object, name);
+    else this.#delattr(object, name);
   }
 
   isKey(object: PythonObject, name: string): boolean {
-    if (this.#builtins.isinstance(object, this.#mapping)) return this.#operator.contains(object, name);
-    const attributes = this.#builtins.getattr(object, "__dict__", null);
+    if (this.#isinstance(object, this.#mapping)) return this.#contains(object, name);
+    const attributes = this.#getattr(object, "__dict__", null);
     if (attributes === null) return false;
     try {
-      return this.#operator.contains(attributes, name);
+      return this.#contains(attributes, name);
     } finally {
       attributes[Symbol.dispose]();
     }
   }
 
   item(object: PythonObject, key: unknown): unknown {
-    return this.#builtins.isinstance(object, this.#mapping) ? this.#operator.getitem(object, key) : this.#builtins.getattr(object, key);
+    return this.#isinstance(object, this.#mapping) ? this.#getitem(object, key) : this.#getattr(object, key);
   }
 
   keys(object: PythonObject): string[] {
-    const mapping = this.#builtins.isinstance(object, this.#mapping);
-    const attributes = mapping ? null : this.#builtins.getattr(object, "__dict__", null);
+    const mapping = this.#isinstance(object, this.#mapping);
+    const attributes = mapping ? null : this.#getattr(object, "__dict__", null);
     if (!mapping && attributes === null) return [];
-    const iterator = this.#builtins.iter(mapping ? object : attributes);
+    const iterator = this.#iter(mapping ? object : attributes);
     try {
       return [...iterator].filter((key): key is string => typeof key === "string");
     } finally {
@@ -74,26 +129,30 @@ export class PythonConversions {
   }
 
   toPrimitive(object: PythonObject, hint: string): unknown {
-    if (hint !== "string" && this.#builtins.isinstance(object, this.#datetime.datetime)) return this.timestamp(object);
-    if (hint !== "string" && this.#builtins.isinstance(object, this.#numbers.Number)) {
+    if (hint !== "string" && this.#isinstance(object, this.#dtDatetime)) return this.timestamp(object);
+    if (hint !== "string" && this.#isinstance(object, this.#numberType)) {
       try {
-        return this.#builtins.isinstance(object, this.#numbers.Integral) ? this.#builtins.int(object) : this.#builtins.float(object);
+        return this.#isinstance(object, this.#integralType) ? this.#int(object) : this.#float(object);
       } catch (error) {
         if (!(error instanceof PythonError) || error.type !== "TypeError") throw error;
         error.exception[Symbol.dispose]();
       }
     }
-    return this.#builtins.str(object);
+    return this.#str(object);
   }
 
   timestamp(object: PythonObject): number | null {
-    if (!this.#builtins.isinstance(object, this.#datetime.datetime)) return null;
+    if (!this.#isinstance(object, this.#dtDatetime)) return null;
     let local: PythonObject | undefined;
     try {
-      if (object.tzinfo === null) local = object.astimezone();
-      const delta = this.#operator.sub(local ?? object, this.#epoch);
+      using tzinfo = object.tzinfo;
+      if (tzinfo === null) {
+        using astimezone = object.astimezone;
+        local = astimezone();
+      }
+      const delta = this.#sub(local ?? object, this.#epoch);
       try {
-        return this.#operator.truediv(this.#operator.floordiv(delta, this.#microsecond), 1000);
+        return this.#truediv(this.#floordiv(delta, this.#microsecond), 1000);
       } finally {
         delta[Symbol.dispose]();
       }
@@ -107,26 +166,27 @@ export class PythonConversions {
   }
 
   fromTimestamp(ms: number): PythonObject {
-    const delta = this.#datetime.timedelta(kwargs({ milliseconds: ms }));
+    const delta = this.#dtTimedelta(kwargs({ milliseconds: ms }));
     try {
-      return this.#operator.add(this.#epoch, delta);
+      return this.#add(this.#epoch, delta);
     } finally {
       delta[Symbol.dispose]();
     }
   }
 
   toJSValue(object: PythonObject, temporal: boolean): [string, ...number[]] | null {
-    const b = this.#builtins;
-    const dt = this.#datetime;
-    if (b.isinstance(object, dt.datetime)) {
+    if (this.#isinstance(object, this.#dtDatetime)) {
       const ms = this.timestamp(object);
       return ms === null ? null : ["Date", ms];
     }
     if (!temporal) return null;
-    if (b.isinstance(object, dt.date)) return ["PlainDate", object.year, object.month, object.day];
-    if (b.isinstance(object, dt.time) && object.tzinfo === null) return ["PlainTime", object.hour, object.minute, object.second, object.microsecond];
-    if (b.isinstance(object, dt.timedelta)) {
-      let total = BigInt(this.#operator.floordiv(object, this.#microsecond));
+    if (this.#isinstance(object, this.#dtDate)) return ["PlainDate", object.year, object.month, object.day];
+    if (this.#isinstance(object, this.#dtTime)) {
+      using tzinfo = object.tzinfo;
+      if (tzinfo === null) return ["PlainTime", object.hour, object.minute, object.second, object.microsecond];
+    }
+    if (this.#isinstance(object, this.#dtTimedelta)) {
+      let total = BigInt(this.#floordiv(object, this.#microsecond));
       const sign = total < 0n ? -1n : 1n;
       if (total < 0n) total = -total;
       const parts: number[] = [];
@@ -141,20 +201,19 @@ export class PythonConversions {
 
   fromTemporal(fields: unknown[]): PythonObject {
     const [kind, ...values] = fields;
-    const dt = this.#datetime;
     switch (kind) {
       case "date":
-        return dt.date(...values);
+        return this.#dtDate(...values);
       case "time":
-        return dt.time(...values);
+        return this.#dtTime(...values);
       case "datetime":
-        return dt.datetime(...values);
+        return this.#dtDatetime(...values);
       case "instant":
       case "duration": {
-        const delta = this.#operator.mul(values[0], this.#microsecond);
+        const delta = this.#mul(values[0], this.#microsecond);
         if (kind === "duration") return delta;
         try {
-          return this.#operator.add(this.#epoch, delta);
+          return this.#add(this.#epoch, delta);
         } finally {
           delta[Symbol.dispose]();
         }
@@ -162,20 +221,21 @@ export class PythonConversions {
       case "zoned": {
         let timezone: PythonObject;
         try {
-          timezone = this.#zoneinfo.ZoneInfo(values[1]);
+          timezone = this.#zoneInfo(values[1]);
         } catch (error) {
           if (!(error instanceof PythonError) || !["ZoneInfoNotFoundError", "ValueError"].includes(error.type)) throw error;
           error.exception[Symbol.dispose]();
-          const offset = this.#operator.mul(values[2], this.#microsecond);
+          const offset = this.#mul(values[2], this.#microsecond);
           try {
-            timezone = dt.timezone(offset);
+            timezone = this.#dtTimezone(offset);
           } finally {
             offset[Symbol.dispose]();
           }
         }
         const instant = this.fromTemporal(["instant", values[0]]);
         try {
-          return instant.astimezone(timezone);
+          using astimezone = instant.astimezone;
+          return astimezone(timezone);
         } finally {
           instant[Symbol.dispose]();
           timezone[Symbol.dispose]();
@@ -187,10 +247,10 @@ export class PythonConversions {
   }
 
   formatException(exception: PythonObject): string {
-    const type: PythonObject = this.#builtins.type(exception);
+    const type: PythonObject = this.#typeFn(exception);
     const traceback: PythonObject | null = exception.__traceback__;
     try {
-      const lines: PythonObject = this.#traceback.format_exception(type, exception, traceback);
+      const lines: PythonObject = this.#formatException(type, exception, traceback);
       try {
         return [...lines].join("");
       } finally {

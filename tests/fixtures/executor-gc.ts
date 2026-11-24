@@ -51,18 +51,23 @@ def ordinary_work():
     clearInterval(timer);
   }
   const collected = before - python.stats().proxies;
+  const freeThreaded = await python.eval<boolean>('__import__("sysconfig").get_config_var("Py_GIL_DISABLED") == 1');
   assert.ok(collected >= 128, `the regression must collect its Python proxies (${collected})`);
   assert.equal(releases, 128, "collected references must run their Python destructors and JavaScript callbacks");
-  assert.ok(acquisitions < collected / 2, `automatic release must batch GIL acquisition (${acquisitions} acquisitions for ${collected} proxies)`);
+  // On free-threaded CPython (biased refcounting), __del__ runs on the executor
+  // thread that created the objects and invokes release_marker() back on the
+  // host thread (one thread-state acquisition per callback); subtract those so
+  // we measure only proxy-release batching.
+  const batchAcquisitions = freeThreaded ? acquisitions - releases : acquisitions;
+  assert.ok(batchAcquisitions < collected / 2, `automatic release must batch GIL acquisition (${batchAcquisitions} non-callback / ${acquisitions} total acquisitions for ${collected} proxies)`);
   assert.ok(ticks >= 5, `Node.js timers must run during Python execution and proxy collection (${ticks} ticks)`);
-  const freeThreaded = await python.eval<boolean>('__import__("sysconfig").get_config_var("Py_GIL_DISABLED") == 1');
   const explicit = await create();
   explicit[Symbol.dispose]();
   // Free-threaded CPython defers deallocation to the creating thread (here the
   // executor) when the last reference is dropped elsewhere (biased reference
   // counting); that thread merges it the next time it runs Python code.
   if (freeThreaded) {
-    for (const deadline = Date.now() + 5000; releases < 129 && Date.now() < deadline; ) {
+    for (const deadline = Date.now() + 5000; releases < 129 && Date.now() < deadline;) {
       await python.eval("None");
       await immediate();
     }

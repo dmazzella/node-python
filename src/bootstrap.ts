@@ -42,25 +42,43 @@ export class PythonBootstrap {
   readonly mainThread: number | bigint;
 
   constructor(builtins: PythonObject, importModule: (name: string) => PythonObject) {
-    const module = (this.module = importModule("types").ModuleType("_node_ctypes"));
-    module.threading = importModule("threading");
-    module.weakref = importModule("weakref");
-    module._main = this.mainThread = module.threading.get_ident();
-    module._execution = builtins.list([null]);
-    const deque = importModule("collections").deque;
-    module._released = deque();
+    using types = importModule("types");
+    using collections = importModule("collections");
+    const module = (this.module = types.ModuleType("_node_ctypes"));
+    using threading = importModule("threading");
+    using weakref = importModule("weakref");
+    module.threading = threading;
+    module.weakref = weakref;
+    module._main = this.mainThread = threading.get_ident();
+    using execution = builtins.list([null]);
+    module._execution = execution;
+    using deque = collections.deque;
+    using released = deque();
+    module._released = released;
     module._op = null;
     definePython(builtins, module, CALLABLE, "<node-python callables>");
     this.wrap = module.wrap;
-    this.javascriptCode = [...this.wrap.__code__.co_consts].find((value) => typeof value === "function" && builtins.getattr(value, "co_name", null) === "javascript");
-    if (!this.javascriptCode) throw new Error("Python callable adapter has no javascript code object");
+    using wrapCode = this.wrap.__code__;
+    using consts = wrapCode.co_consts;
+    let javascriptCode: PythonObject | undefined;
+    for (const value of consts) {
+      if (javascriptCode === undefined && typeof value === "function" && builtins.getattr(value, "co_name", null) === "javascript") {
+        javascriptCode = value;
+      } else if (value !== null && (typeof value === "object" || typeof value === "function") && Symbol.dispose in value) {
+        (value as Disposable)[Symbol.dispose]();
+      }
+    }
+    if (!javascriptCode) throw new Error("Python callable adapter has no javascript code object");
+    this.javascriptCode = javascriptCode;
     module.JAVASCRIPT_CODE = this.javascriptCode;
-    module.JsProxy = builtins.type("JsProxy", Tuple.of(builtins.object), {
+    using jsProxy = builtins.type("JsProxy", Tuple.of(builtins.object), {
       __module__: "_node_ctypes",
       __slots__: Tuple.of("_id", "__weakref__"),
       __doc__: "A JavaScript object used by reference: attributes, items, len(),\n    iteration (also async for), await (promises), dir(), repr().",
     });
-    module._JsAsyncIterator = builtins.type("_JsAsyncIterator", Tuple.of(builtins.object), { __module__: "_node_ctypes" });
+    module.JsProxy = jsProxy;
+    using asyncIter = builtins.type("_JsAsyncIterator", Tuple.of(builtins.object), { __module__: "_node_ctypes" });
+    module._JsAsyncIterator = asyncIter;
     this.objectType = module.JsProxy;
   }
 }

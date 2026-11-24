@@ -8,7 +8,7 @@ import { PythonScheduler } from "./scheduler.ts";
 import { PythonPlatform, lineWriter } from "./platform.ts";
 import { PythonConversions } from "./conversions.ts";
 import { PythonBuffers } from "./buffers.ts";
-import { PythonExecutor } from "./executor.ts";
+import { PythonExecutor, nextCompletionToken } from "./executor.ts";
 import type { Cancellable, Outcome } from "./executor.ts";
 import { NativeObjects, nativeSlot } from "./objects.ts";
 import type { NativeSlot } from "./objects.ts";
@@ -34,6 +34,8 @@ interface FunctionEntry {
   isClass: boolean;
 }
 interface AwaitEntry {
+  state: ProxyState;
+  public: boolean;
   future: PythonObject | null;
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
@@ -70,6 +72,9 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 const EVENT_DONE = 0;
 const EVENT_CALL = 1;
 const EVENT_CANCEL = 2;
+const INT64_MIN = -(1n << 63n);
+const INT64_MAX = (1n << 63n) - 1n;
+const UTF8_SCRATCH_SIZE = 4096;
 const isIndex = (prop: string) => /^-?(0|[1-9]\d*)$/.test(prop);
 
 // Function.prototype members used by JavaScript code on callables (handler.apply(this, args), fn.bind()).
@@ -148,7 +153,15 @@ export class Python {
   #keep = new WeakMap<ArrayBufferLike, unknown>(); // ArrayBuffer of Python memory → holder that pins it
   #busy = new Int32Array(1); // 1 while the main thread runs Python code (read by Python threads)
   #proxies = 0; // live PyObject proxies
-  #nextToken = 1;
+  #lastAwaitToken = 0;
+  // Reusable out-slots for non-reentrant C-API reads under the GIL (#fromPy).
+  #overflowOut = new c_int();
+  #overflowOutRef = byref(this.#overflowOut);
+  #sizeOut = new c_ssize_t();
+  #sizeOutRef = byref(this.#sizeOut);
+  #ptrOut = new c_void_p();
+  #ptrOutRef = byref(this.#ptrOut);
+  #utf8Scratch = Buffer.allocUnsafe(UTF8_SCRATCH_SIZE);
   #channel: ThreadSafeCallbackWrapper | null = null; // threadSafeCallback woken by Python threads (see #openChannel)
   #main!: PythonObject;
   #builtins!: PythonObject;
@@ -395,8 +408,9 @@ export class Python {
     this.#openChannel();
 
     // The environment of the probed interpreter (virtual environment included).
-    const sys = this.#import("sys");
-    sys.modules["_node_ctypes"] = adapters;
+    using sys = this.#import("sys");
+    using sysModules = sys.modules;
+    sysModules["_node_ctypes"] = adapters;
     let notify: bigint | undefined;
     if (this.#synchronousCallbacks) {
       const registration = adapters.register_native_dispatcher(() => this.#nativeObjects?.drain());
@@ -511,32 +525,40 @@ export class Python {
    */
   module(name: string, members: Record<string, unknown>): PublicPythonObject {
     return this.#withGIL(() => {
-      const types = this.#import("types");
-      const modules = this.#import("sys").modules;
-      const module = types.ModuleType(name);
+      using types = this.#import("types");
+      using sys = this.#import("sys");
+      using modules = sys.modules;
+      using module = types.ModuleType(name);
       for (const [key, value] of Object.entries(members)) module[key] = value;
       modules.__setitem__(name, module);
       // Link the module to its parent package, creating the missing ones.
-      for (let child = module, childName = name; childName.includes(".");) {
-        const dot = childName.lastIndexOf(".");
-        const parentName = childName.slice(0, dot);
-        let parent = modules.get(parentName);
-        let created = false;
-        if (parent === null) {
-          try {
-            parent = this.#import(parentName); // an existing package (json for json.extra)
-          } catch (error) {
-            const missing = error instanceof PythonError && error.type === "ModuleNotFoundError" ? error.exception.name : null;
-            if (!(missing === parentName || parentName.startsWith(`${missing}.`))) throw error;
-            parent = types.ModuleType(parentName);
-            parent.__path__ = []; // a package
-            modules.__setitem__(parentName, parent);
-            created = true;
+      const temporaries: PythonObject[] = [];
+      try {
+        for (let child = module, childName = name; childName.includes(".");) {
+          const dot = childName.lastIndexOf(".");
+          const parentName = childName.slice(0, dot);
+          let parent = modules.get(parentName);
+          let created = false;
+          if (parent === null) {
+            try {
+              parent = this.#import(parentName); // an existing package (json for json.extra)
+            } catch (error) {
+              const missing = error instanceof PythonError && error.type === "ModuleNotFoundError" ? error.exception.name : null;
+              if (!(missing === parentName || parentName.startsWith(`${missing}.`))) throw error;
+              if (error instanceof PythonError) error.exception[Symbol.dispose]();
+              parent = types.ModuleType(parentName);
+              parent.__path__ = []; // a package
+              modules.__setitem__(parentName, parent);
+              created = true;
+            }
           }
+          temporaries.push(parent);
+          this.#builtins.setattr(parent, childName.slice(dot + 1), child);
+          if (!created) break;
+          [child, childName] = [parent, parentName];
         }
-        this.#builtins.setattr(parent, childName.slice(dot + 1), child);
-        if (!created) break;
-        [child, childName] = [parent, parentName];
+      } finally {
+        for (const temp of temporaries) temp[Symbol.dispose]();
       }
       return this.#expose(module) as PublicPythonObject;
     });
@@ -578,7 +600,7 @@ export class Python {
           try {
             control?.cancel?.();
             const state = this.#states.get(owned ? awaitable : control?.awaitable);
-            if (state?.ptr) this.#withGIL(() => state.future?.cancel());
+            if (state?.ptr && state.future) this.#withGIL(() => this.#cancelFuture(state.future!));
           } catch {
             // Cancellation is best-effort: the promise still rejects with the reason.
           }
@@ -607,62 +629,69 @@ export class Python {
    * promise, the context manager is exited when it settles.
    *
    * @example python.with(python.builtins.open(file), (f) => f.read())
-   * @param {*} manager - Context manager (PyObject proxy)
+   * @param {*} pending - Context manager (PyObject proxy or promise)
    * @param {Function} body - Called with the value of `__enter__()`
    * @returns {*} What `body` returns (undefined if the error was suppressed)
    */
-  async with<T, Entered = PublicPythonObject>(pending: PublicPythonObject | PromiseLike<PublicPythonObject>, body: (value: Entered) => T): Promise<Awaited<T> | undefined> {
-    const manager = await pending;
-    const [enter, exit] = this.#withGIL(() => {
-      const type = this.#builtins.type(manager);
-      return [type.__enter__, type.__exit__];
-    });
-    const value = await this.#callAsync(enter, [manager]);
-    let result;
-    try {
-      result = await body(value as Entered);
-    } catch (error) {
-      if (await this.#exit(exit, manager, error)) return undefined;
-      throw error;
-    }
-    await this.#callAsync(exit, [manager, null, null, null]);
-    return result;
+  with<T, Entered = PublicPythonObject>(pending: PublicPythonObject | PromiseLike<PublicPythonObject>, body: (value: Entered) => T): Promise<Awaited<T> | undefined> {
+    return this.#withContext(pending, "__enter__", "__exit__", body);
   }
 
   /**
    * Python's `async with` statement for asynchronous context managers
    * (`__aenter__` / `__aexit__`), awaited on the asyncio event loop.
    *
-   * @param {*} manager - Asynchronous context manager (PyObject proxy)
+   * @param {*} pending - Asynchronous context manager (PyObject proxy or promise)
    * @param {Function} body - Called with the value of `__aenter__()`; may be async
    * @returns {Promise<*>} What `body` returns (undefined if the error was suppressed)
    */
-  async asyncWith<T, Entered = PublicPythonObject>(pending: PublicPythonObject | PromiseLike<PublicPythonObject>, body: (value: Entered) => T): Promise<Awaited<T> | undefined> {
+  asyncWith<T, Entered = PublicPythonObject>(pending: PublicPythonObject | PromiseLike<PublicPythonObject>, body: (value: Entered) => T): Promise<Awaited<T> | undefined> {
+    return this.#withContext(pending, "__aenter__", "__aexit__", body);
+  }
+
+  async #withContext<T, Entered = PublicPythonObject>(pending: PublicPythonObject | PromiseLike<PublicPythonObject>, enterName: string, exitName: string, body: (value: Entered) => T): Promise<Awaited<T> | undefined> {
     const manager = await pending;
     const [enter, exit] = this.#withGIL(() => {
-      const type = this.#builtins.type(manager);
-      return [type.__aenter__, type.__aexit__];
+      using type = this.#builtins.type(manager);
+      return [type[enterName] as PythonObject, type[exitName] as PythonObject];
     });
-    const value = await this.#callAsync(enter, [manager]);
-    let result;
     try {
-      result = await body(value as Entered);
-    } catch (error) {
-      if (await this.#exit(exit, manager, error)) return undefined;
-      throw error;
+      const value = await this.#callAsync(enter, [manager]);
+      let result: Awaited<T>;
+      try {
+        result = await body(value as Entered);
+      } catch (error) {
+        if (await this.#exit(exit, manager, error)) return undefined;
+        throw error;
+      }
+      const exitResult = await this.#callAsync(exit, [manager, null, null, null]);
+      if (this.#states.has(exitResult)) this.#release(exitResult as PythonObject);
+      return result;
+    } finally {
+      enter[Symbol.dispose]();
+      exit[Symbol.dispose]();
     }
-    await this.#callAsync(exit, [manager, null, null, null]);
-    return result;
   }
 
   /** Call `__exit__` / `__aexit__` with the Python version of a JavaScript error. */
   async #exit(exit: PythonObject, manager: PublicPythonObject, error: unknown): Promise<boolean> {
-    const args = this.#withGIL(() => {
+    const [exc, excType, tb] = this.#withGIL(() => {
       const exc = this.#wrap(this.#exception(error));
-      return [manager, this.#builtins.type(exc), exc, exc.__traceback__];
+      return [exc, this.#builtins.type(exc) as PythonObject, exc.__traceback__ as PythonObject | null];
     });
-    const result = await this.#callAsync(exit, args);
-    return this.#withGIL(() => this.#builtins.bool(result));
+    let result: unknown;
+    try {
+      result = await this.#callAsync(exit, [manager, excType, exc, tb]);
+    } finally {
+      tb?.[Symbol.dispose]();
+      excType[Symbol.dispose]();
+      exc[Symbol.dispose]();
+    }
+    try {
+      return this.#withGIL(() => this.#builtins.bool(result));
+    } finally {
+      if (this.#states.has(result)) this.#release(result as PythonObject);
+    }
   }
 
   #controlled<T>(work: (control: CallControl) => Promise<T>): Promise<T> {
@@ -914,6 +943,25 @@ export class Python {
     });
   }
 
+  /**
+   * Transfer ownership of a temporary internal proxy into a public proxy
+   * (zero Py_IncRef/Py_DecRef, zero leaked intermediate proxy).
+   */
+  #takeExposed(value: unknown): unknown {
+    const state = this.#states.get(value);
+    if (!state || state.public) return value;
+    const ptr = this.#pointer(value);
+    state.ptr = null;
+    this.#registry.unregister(state);
+    this.#proxies--;
+    return this.#wrap(ptr, true);
+  }
+
+  #cancelFuture(future: PythonObject): void {
+    using cancel = future.cancel;
+    cancel();
+  }
+
   // ── Conversions (GIL held) ────────────────────────────────────────
 
   #pointer(proxy: unknown): bigint {
@@ -929,11 +977,6 @@ export class Python {
   #check(ptr: Pointer): bigint {
     if (!ptr) throw this.#fetchError();
     return ptr;
-  }
-
-  #run(source: string, start: number, globals: Pointer): bigint {
-    const api = this.#api;
-    return this.#using(this.#check(api.Py_CompileString(source, "<string>", start)), (code) => this.#check(api.PyEval_EvalCode(code, globals, globals)));
   }
 
   #import(name: string): PythonObject {
@@ -999,26 +1042,30 @@ export class Python {
       case T.PyBool_Type:
         return ptr === this.#true;
       case T.PyLong_Type: {
-        const overflow = new c_int();
-        const value = api.PyLong_AsLongLongAndOverflow(ptr, byref(overflow));
-        if (overflow.value) return BigInt(this.#take<string>(api.PyObject_Str(ptr)));
+        const value = api.PyLong_AsLongLongAndOverflow(ptr, this.#overflowOutRef);
+        if (this.#overflowOut.value) return BigInt(this.#take<string>(api.PyObject_Str(ptr)));
         return value >= -9007199254740991n && value <= 9007199254740991n ? Number(value) : value;
       }
       case T.PyFloat_Type:
         return api.PyFloat_AsDouble(ptr);
       case T.PyUnicode_Type: {
-        const size = new c_ssize_t();
-        const data = this.#check(api.PyUnicode_AsUTF8AndSize(ptr, byref(size)));
-        const utf8 = Buffer.alloc(Number(size.value));
-        if (utf8.length) memmove(utf8, data, utf8.length);
+        const data = this.#check(api.PyUnicode_AsUTF8AndSize(ptr, this.#sizeOutRef));
+        const length = Number(this.#sizeOut.value);
+        if (length === 0) return "";
+        if (length <= UTF8_SCRATCH_SIZE) {
+          memmove(this.#utf8Scratch, data, length);
+          return this.#utf8Scratch.toString("utf8", 0, length);
+        }
+        const utf8 = Buffer.allocUnsafe(length);
+        memmove(utf8, data, length);
         return utf8.toString("utf8");
       }
       case T.PyBytes_Type: {
-        const data = new c_void_p();
-        const size = new c_ssize_t();
-        if (api.PyBytes_AsStringAndSize(ptr, byref(data), byref(size)) < 0) throw this.#fetchError();
-        const bytes = Buffer.alloc(Number(size.value));
-        if (bytes.length) memmove(bytes, data.value, bytes.length);
+        if (api.PyBytes_AsStringAndSize(ptr, this.#ptrOutRef, this.#sizeOutRef) < 0) throw this.#fetchError();
+        const length = Number(this.#sizeOut.value);
+        if (length === 0) return Buffer.alloc(0);
+        const bytes = Buffer.allocUnsafe(length);
+        memmove(bytes, this.#ptrOut.value, length);
         return bytes;
       }
     }
@@ -1046,14 +1093,29 @@ export class Python {
               return items;
             }
             case T.PyDict_Type: {
-              const entries: [unknown, unknown][] = [];
               const pos = new c_ssize_t();
               const key = new c_void_p();
               const value = new c_void_p();
-              while (api.PyDict_Next(ptr, byref(pos), byref(key), byref(value))) {
-                entries.push([this.#fromPy(key.value, true, ancestors, external), this.#fromPy(value.value, true, ancestors, external)]);
+              const posRef = byref(pos);
+              const keyRef = byref(key);
+              const valueRef = byref(value);
+              let record: Record<string, unknown> | null = {};
+              let map: Map<unknown, unknown> | null = null;
+              while (api.PyDict_Next(ptr, posRef, keyRef, valueRef)) {
+                const k = this.#fromPy(key.value, true, ancestors, external);
+                const v = this.#fromPy(value.value, true, ancestors, external);
+                if (map !== null) {
+                  map.set(k, v);
+                } else if (typeof k === "string") {
+                  if (k === "__proto__") Object.defineProperty(record!, k, { value: v, writable: true, enumerable: true, configurable: true });
+                  else record![k] = v;
+                } else {
+                  map = new Map(Object.entries(record!));
+                  record = null;
+                  map.set(k, v);
+                }
               }
-              return entries.every(([k]) => typeof k === "string") ? Object.fromEntries(entries) : new Map(entries);
+              return map ?? record!;
             }
             case T.PySet_Type:
             case T.PyFrozenSet_Type:
@@ -1114,7 +1176,7 @@ export class Python {
         if (!Number.isInteger(value)) return this.#check(api.PyFloat_FromDouble(value));
         return this.#check(Number.isSafeInteger(value) ? api.PyLong_FromLongLong(value) : api.PyLong_FromDouble(value));
       case "bigint":
-        return this.#check(api.PyLong_FromString(value.toString(), null, 10));
+        return this.#check(value >= INT64_MIN && value <= INT64_MAX ? api.PyLong_FromLongLong(value) : api.PyLong_FromString(value.toString(), null, 10));
       case "string": {
         const utf8 = Buffer.from(value, "utf8");
         return this.#check(api.PyUnicode_DecodeUTF8(utf8, utf8.length, null));
@@ -1132,7 +1194,10 @@ export class Python {
       const fields = temporalFields(value);
       if (fields) return this.#takeProxy(this.#conversions.fromTemporal(fields));
     }
-    if (value instanceof Uint8Array && !(value instanceof Uint8ClampedArray)) return this.#check(api.PyBytes_FromStringAndSize(Buffer.from(value.buffer, value.byteOffset, value.byteLength), value.byteLength));
+    if (value instanceof Uint8Array && !(value instanceof Uint8ClampedArray)) {
+      const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+      return this.#check(api.PyBytes_FromStringAndSize(bytes, bytes.byteLength));
+    }
     if (ArrayBuffer.isView(value) || isArrayBuffer(value)) return this.#memoryview(value);
     if (typeof value !== "object") throw new TypeError(`Cannot convert a JavaScript ${typeof value} to Python`);
     const proto = Object.getPrototypeOf(value);
@@ -1217,10 +1282,14 @@ export class Python {
       if (copy) return new Type(copy.buffer, copy.byteOffset, copy.length / Type.BYTES_PER_ELEMENT);
       if (!size) return new Type(0);
       if (!EXTERNAL_BUFFERS) {
-        // Electron forbids buffers over external memory: a copy.
-        const copied = new Type(size / Type.BYTES_PER_ELEMENT);
-        memmove(Buffer.from(copied.buffer), address, size);
-        return copied;
+        // Electron forbids buffers over external memory: copy and release the buffer lock immediately.
+        try {
+          const copied = new Type(size / Type.BYTES_PER_ELEMENT);
+          memmove(Buffer.from(copied.buffer), address, size);
+          return copied;
+        } finally {
+          holder?.[Symbol.dispose]();
+        }
       }
       const memory = array(c_uint8, size).from_address(address)._buffer; // Python: memoryview((c_ubyte * size).from_address(address))
       this.#keep.set(memory.buffer, holder); // pins the Python buffer while the memory is used
@@ -1441,10 +1510,13 @@ export class Python {
           missingAttribute();
           try {
             const value = this.#conversions.getFallback(target, prop);
-            return this.#states.get(target)!.public ? this.#expose(value) : value;
+            return this.#states.get(target)!.public ? this.#takeExposed(value) : value;
           } catch (error) {
             // Function.prototype members of callables (see FUNCTION_MEMBERS).
-            if (FUNCTION_MEMBERS.has(prop) && error instanceof PythonError && error.type === "AttributeError") return Reflect.get(target, prop);
+            if (FUNCTION_MEMBERS.has(prop) && error instanceof PythonError && error.type === "AttributeError") {
+              error.exception[Symbol.dispose]();
+              return Reflect.get(target, prop);
+            }
             throw error;
           }
         });
@@ -1474,16 +1546,13 @@ export class Python {
       // Object.keys(), Object.entries(), { ...dict }, for...in: the string keys of mappings.
       ownKeys: (target) => this.#withGIL(() => this.#conversions.keys(target)),
       getOwnPropertyDescriptor: (target, prop) => {
-        if (typeof prop === "string" && this.#withGIL(() => this.#conversions.isKey(target, prop))) {
-          return {
-            value: this.#withGIL(() => {
-              const value = this.#conversions.item(target, prop);
-              return this.#states.get(target)!.public ? this.#expose(value) : value;
-            }),
-            writable: true,
-            enumerable: true,
-            configurable: true,
-          };
+        if (typeof prop === "string") {
+          const found = this.#withGIL(() => {
+            if (!this.#conversions.isKey(target, prop)) return undefined;
+            const value = this.#conversions.item(target, prop);
+            return { value: this.#states.get(target)!.public ? this.#takeExposed(value) : value };
+          });
+          if (found) return { value: found.value, writable: true, enumerable: true, configurable: true };
         }
         return Reflect.getOwnPropertyDescriptor(target, prop);
       },
@@ -1530,8 +1599,15 @@ export class Python {
           if (this.#states.has(value) && this.#scheduler!.isAwaitable(value as PythonObject)) {
             const awaitable = value as PythonObject;
             control.awaitable = awaitable;
-            value = this.#promise(awaitable);
-            if (control.aborted) this.#states.get(awaitable)!.future?.cancel();
+            const awaited = this.#promise(awaitable);
+            value = awaited.finally(() => {
+              control.awaitable = undefined;
+              this.#release(awaitable);
+            });
+            if (control.aborted) {
+              const future = this.#states.get(awaitable)!.future;
+              if (future) this.#cancelFuture(future);
+            }
           }
           return { value };
         } finally {
@@ -1580,7 +1656,7 @@ export class Python {
         yield item;
       }
     } finally {
-      if (!this.#finalized) this.#withGIL(() => api.Py_DecRef(iterator));
+      if (!this.#finalized && !this.#nativeFinalizing) this.#withGIL(() => api.Py_DecRef(iterator), true);
     }
   }
 
@@ -1590,18 +1666,41 @@ export class Python {
     let finished = false;
     try {
       while (true) {
-        const [done, value] = await this.#scheduler!.next(iterator);
+        const step = this.#withGIL(() => this.#scheduler!.next(iterator));
+        let pair: PythonObject;
+        try {
+          pair = (await step) as PythonObject;
+        } finally {
+          step[Symbol.dispose]();
+        }
+        let done: boolean;
+        let value: unknown;
+        try {
+          [done, value] = pair as unknown as [boolean, unknown];
+        } finally {
+          if (this.#states.has(pair)) pair[Symbol.dispose]();
+        }
         if (done) {
           finished = true;
           return;
         }
-        yield this.#withGIL(() => this.#expose(value));
+        yield this.#withGIL(() => this.#takeExposed(value));
       }
     } finally {
-      // break / return / throw in the loop: close the async generator.
-      if (!finished && !this.#finalized) {
-        const close = this.#scheduler!.closeIterator(iterator);
-        if (close !== null) await close;
+      try {
+        // break / return / throw in the loop: close the async generator.
+        if (!finished && !this.#finalized) {
+          const close = this.#withGIL(() => this.#scheduler!.closeIterator(iterator));
+          if (close !== null) {
+            try {
+              await close;
+            } finally {
+              if (this.#states.has(close)) (close as PythonObject)[Symbol.dispose]();
+            }
+          }
+        }
+      } finally {
+        iterator[Symbol.dispose]();
       }
     }
   }
@@ -1623,12 +1722,13 @@ export class Python {
   #promise(target: unknown): Promise<unknown> {
     const state = this.#states.get(target)!;
     state.promise ??= new Promise((resolve, reject) => {
-      const token = this.#nextToken++;
+      const token = (this.#lastAwaitToken = nextCompletionToken(this.#lastAwaitToken, this.#awaits));
       this.#withGIL(() => {
-        this.#awaits.set(token, { resolve, reject, future: null });
+        const entry: AwaitEntry = { state, public: state.public, resolve, reject, future: null };
+        this.#awaits.set(token, entry);
         this.#channel!.ref(); // Node.js waits for Python
         try {
-          state.future = this.#awaits.get(token)!.future = this.#usingProxy(this.#pointer(target), (awaitable) => {
+          state.future = entry.future = this.#usingProxy(this.#pointer(target), (awaitable) => {
             const future = this.#scheduler!.submit(awaitable, token);
             return future === awaitable ? this.#wrap(this.#toPy(future)) : future;
           });
@@ -1665,11 +1765,21 @@ export class Python {
         if (!entry) break;
         this.#awaits.delete(token);
         this.#withGIL(() => {
+          const future = entry.future!;
+          entry.future = null;
+          if (entry.state.future === future) entry.state.future = undefined;
+          let value: unknown;
           try {
-            entry.resolve(entry.future!.result());
+            using resultFn = future.result;
+            value = resultFn();
+            if (entry.public) value = this.#takeExposed(value);
           } catch (error) {
             entry.reject(error);
+            return;
+          } finally {
+            this.#release(future);
           }
+          entry.resolve(value);
         });
         this.#unrefChannel();
         break;
@@ -1706,12 +1816,12 @@ export class Python {
         try {
           const fid: unknown = request[0];
           if (typeof fid !== "bigint" && (typeof fid !== "number" || !Number.isSafeInteger(fid))) throw new TypeError("Invalid JavaScript function identifier");
-          const args: PythonObject = request[1];
-          const kw: PythonObject = request[2];
+          using args: PythonObject = request[1];
+          using kw: PythonObject = request[2];
           const entry = this.#functions.get(BigInt(fid));
           if (!entry) throw new Error("JavaScript function has been released");
-          const jsArgs: unknown[] = [...args].map((value) => this.#expose(value));
-          if (this.#builtins.len(kw) > 0) jsArgs.push(this.#fromPy(this.#pointer(kw), true, undefined, true));
+          const jsArgs: unknown[] = [...args].map((value) => this.#takeExposed(value));
+          if (this.#api.PyDict_Size(this.#pointer(kw)) > 0) jsArgs.push(this.#fromPy(this.#pointer(kw), true, undefined, true));
           return [entry, jsArgs];
         } finally {
           request[Symbol.dispose]();
@@ -1830,9 +1940,7 @@ export class Python {
     const pythonType = errorProperty(error, PY_TYPE);
     if (pythonType) {
       const exc = this.#builtins[String(pythonType)](errorProperty(error, "message"));
-      const ptr = this.#pointer(exc);
-      api.Py_IncRef(ptr);
-      return ptr;
+      return this.#takeProxy(exc);
     }
     // A Python exception that went through JavaScript keeps its type.
     if (error instanceof PythonError && this.#states.get(error.exception)?.ptr) {
@@ -1840,7 +1948,7 @@ export class Python {
       api.Py_IncRef(exc);
       return exc;
     }
-    const exc = this.#using(this.#check(api.PyUnicode_DecodeUTF8(...this.#utf8(`JavaScript ${errorProperty(error, "name") ?? "Error"}: ${errorProperty(error, "message") ?? String(error)}`), null)), (message) => {
+    const exc = this.#using(this.#toPy(`JavaScript ${errorProperty(error, "name") ?? "Error"}: ${errorProperty(error, "message") ?? String(error)}`), (message) => {
       const tuple = this.#filled(api.PyTuple_New(1), (t) => {
         api.Py_IncRef(message);
         api.PyTuple_SetItem(t, 0, message);
@@ -1859,11 +1967,6 @@ export class Python {
       api.Py_DecRef(exc);
       throw e;
     }
-  }
-
-  #utf8(text: string): [Buffer, number] {
-    const bytes = Buffer.from(text, "utf8");
-    return [bytes, bytes.length];
   }
 
   /** Current Python exception → PythonError (clears the exception). */

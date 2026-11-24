@@ -182,7 +182,7 @@ export class PythonExecutor {
         api.Py_IncRef(helper);
         this.#helpers.set(name, helper);
       }
-      entry = BigInt(api.PyLong_AsLongLong(check(api.PyDict_GetItemString(this.#namespace, "_entry_address"))));
+      entry = check(api.PyLong_AsVoidPtr(check(api.PyDict_GetItemString(this.#namespace, "_entry_address"))));
     } catch (error) {
       this.#releasePython();
       throw error;
@@ -232,9 +232,18 @@ export class PythonExecutor {
     const settled = task.then(
       (value): Outcome => {
         try {
-          if (cancelled) this.#tokenHelper("_discard", token);
-          if (value !== null) return { value };
-          return { error: this.#withGIL(() => this.#withToken(token, (id) => this.#call("_take_failure", [id]))) };
+          if (value !== null) {
+            if (cancelled) this.#tokenHelper("_discard", token);
+            return { value };
+          }
+          return {
+            error: this.#withGIL(() =>
+              this.#withToken(token, (id) => {
+                if (cancelled) this.#api.Py_DecRef(this.#call("_discard", [id]));
+                return this.#call("_take_failure", [id]);
+              }),
+            ),
+          };
         } finally {
           done();
         }
